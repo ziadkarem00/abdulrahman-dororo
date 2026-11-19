@@ -27,13 +27,21 @@ export interface Episode {
 
 export type ServerId = "primary" | "mal-mirror" | "dub";
 
+export interface EmbedCaptionOptions {
+  nativeEnglish: boolean;
+  captionSize?: "s" | "m" | "l" | "xl";
+  captionColor?: string;
+  captionBg?: 0 | 1;
+}
+
 export interface StreamServer {
   id: ServerId;
   label: string;
   shortLabel: string;
   badge: string;
   description: string;
-  buildUrl: (episodeNumber: number) => string;
+  supportsNativeEn: boolean;
+  buildUrl: (episodeNumber: number, options?: EmbedCaptionOptions) => string;
 }
 
 export type SubtitleLang = "ar" | "en" | "off";
@@ -42,6 +50,14 @@ export interface SubtitleCue {
   start: number;
   end: number;
   text: string;
+}
+
+export interface SubtitleTrack {
+  id: string;
+  label: string;
+  source: string;
+  count: number;
+  cues: SubtitleCue[];
 }
 
 export type SubtitleSize = "sm" | "md" | "lg" | "xl";

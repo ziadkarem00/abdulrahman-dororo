@@ -1,14 +1,34 @@
-import type { ArcId, Episode, StoryArc, StreamServer } from "@/types/dororo";
+import type {
+  ArcId,
+  EmbedCaptionOptions,
+  Episode,
+  StoryArc,
+  StreamServer,
+} from "@/types/dororo";
 
 export const DORORO_ANILIST_ID = 101347;
 export const DORORO_MAL_ID = 37520;
 export const DORORO_IMDB_ID = "tt9458304";
 export const TOTAL_EPISODES = 24;
 
-// Hide AnimeEmbed's built-in settings, captions, fullscreen, and PiP buttons
-// so our synced Arabic/English overlay and custom fullscreen wrapper control everything cleanly.
-const COMMON_EMBED_PARAMS =
-  "captions=off&hide=settings,captions,fullscreen,pip&accent=c81e1e&autoSkip=1";
+function buildCommonParams(options?: EmbedCaptionOptions): string {
+  const params = new URLSearchParams({
+    hide: "settings,captions,fullscreen,pip",
+    accent: "c81e1e",
+    autoSkip: "1",
+  });
+
+  if (options?.nativeEnglish) {
+    params.set("captions", "en");
+    params.set("captionSize", options.captionSize ?? "m");
+    params.set("captionColor", options.captionColor ?? "ffffff");
+    params.set("captionBg", String(options.captionBg ?? 0));
+  } else {
+    params.set("captions", "off");
+  }
+
+  return params.toString();
+}
 
 export const STREAM_SERVERS: StreamServer[] = [
   {
@@ -17,8 +37,11 @@ export const STREAM_SERVERS: StreamServer[] = [
     shortLabel: "Server 1",
     badge: "SUB",
     description: "AniList Primary Stream (Japanese Audio)",
-    buildUrl: (ep: number) =>
-      `https://animeembed.com/embed/ani/${DORORO_ANILIST_ID}/${ep}?track=sub&server=1&${COMMON_EMBED_PARAMS}`,
+    supportsNativeEn: true,
+    buildUrl: (ep: number, options?: EmbedCaptionOptions) =>
+      `https://animeembed.com/embed/ani/${DORORO_ANILIST_ID}/${ep}?track=sub&server=1&${buildCommonParams(
+        options
+      )}`,
   },
   {
     id: "mal-mirror",
@@ -26,8 +49,11 @@ export const STREAM_SERVERS: StreamServer[] = [
     shortLabel: "Server 2",
     badge: "SUB",
     description: "MyAnimeList Backup Mirror (Japanese Audio)",
-    buildUrl: (ep: number) =>
-      `https://animeembed.com/embed/mal/${DORORO_MAL_ID}/${ep}?track=sub&server=2&${COMMON_EMBED_PARAMS}`,
+    supportsNativeEn: true,
+    buildUrl: (ep: number, options?: EmbedCaptionOptions) =>
+      `https://animeembed.com/embed/mal/${DORORO_MAL_ID}/${ep}?track=sub&server=2&${buildCommonParams(
+        options
+      )}`,
   },
   {
     id: "dub",
@@ -35,8 +61,11 @@ export const STREAM_SERVERS: StreamServer[] = [
     shortLabel: "Server 3 • Dub",
     badge: "DUB",
     description: "English Dubbed Audio Stream",
+    supportsNativeEn: false,
     buildUrl: (ep: number) =>
-      `https://animeembed.com/embed/ani/${DORORO_ANILIST_ID}/${ep}?track=dub&${COMMON_EMBED_PARAMS}`,
+      `https://animeembed.com/embed/ani/${DORORO_ANILIST_ID}/${ep}?track=dub&${buildCommonParams(
+        { nativeEnglish: false }
+      )}`,
   },
 ];
 
@@ -47,7 +76,8 @@ export const STORY_ARCS: StoryArc[] = [
     shortName: "All (1–24)",
     startEpisode: 1,
     endEpisode: 24,
-    description: "Complete 24-episode 2019 adaptation by MAPPA & Tezuka Productions.",
+    description:
+      "Complete 24-episode 2019 adaptation by MAPPA & Tezuka Productions.",
   },
   {
     id: "awakening",
@@ -55,7 +85,8 @@ export const STORY_ARCS: StoryArc[] = [
     shortName: "Ep 1–6",
     startEpisode: 1,
     endEpisode: 6,
-    description: "Daigo's pact, Jukai's prosthetics, and Hyakkimaru reclaiming pain, hearing, and voice.",
+    description:
+      "Daigo's pact, Jukai's prosthetics, and Hyakkimaru reclaiming pain, hearing, and voice.",
   },
   {
     id: "sengoku-roads",
@@ -63,7 +94,8 @@ export const STORY_ARCS: StoryArc[] = [
     shortName: "Ep 7–12",
     startEpisode: 7,
     endEpisode: 12,
-    description: "Dororo's past, Tahōmaru's rise, and the bloody confrontation at Fort Banmon.",
+    description:
+      "Dororo's past, Tahōmaru's rise, and the bloody confrontation at Fort Banmon.",
   },
   {
     id: "hidden-map",
@@ -71,7 +103,8 @@ export const STORY_ARCS: StoryArc[] = [
     shortName: "Ep 13–18",
     startEpisode: 13,
     endEpisode: 18,
-    description: "The map on Dororo's back, Sabame's village, and the clash at the Cape of No Mercy.",
+    description:
+      "The map on Dororo's back, Sabame's village, and the clash at the Cape of No Mercy.",
   },
   {
     id: "twelve-demons",
@@ -79,7 +112,8 @@ export const STORY_ARCS: StoryArc[] = [
     shortName: "Ep 19–24",
     startEpisode: 19,
     endEpisode: 24,
-    description: "Hyakkimaru's return to Daigo's land and the final reckoning for his humanity.",
+    description:
+      "Hyakkimaru's return to Daigo's land and the final reckoning for his humanity.",
   },
 ];
 
@@ -96,7 +130,10 @@ export function getArcForEpisode(ep: number): {
   if (ep <= 18) {
     return { arcId: "hidden-map", arcName: "The Hidden Map & Cape Hakkotsu" };
   }
-  return { arcId: "twelve-demons", arcName: "The Twelve Demons & Hall of Hell" };
+  return {
+    arcId: "twelve-demons",
+    arcName: "The Twelve Demons & Hall of Hell",
+  };
 }
 
 export const FALLBACK_EPISODES: Episode[] = [

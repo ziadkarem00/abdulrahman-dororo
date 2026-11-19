@@ -6,6 +6,7 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Layers,
   Loader2,
   Maximize,
   Minimize,
@@ -28,10 +29,12 @@ import type {
   SubtitlePosition,
   SubtitleSize,
   SubtitleStyle,
+  SubtitleTrack,
 } from "@/types/dororo";
 
 const SUB_STYLE_STORAGE_KEY = "abdulrahman_dororo_sub_style_v1";
-const SUB_CACHE_VERSION = "3";
+const EP_OFFSET_STORAGE_KEY = "abdulrahman_dororo_ep_offsets_v1";
+const SUB_CACHE_VERSION = "4";
 
 const DEFAULT_SUB_STYLE: SubtitleStyle = {
   size: "md",
@@ -78,11 +81,15 @@ export function VideoPlayer({
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const styleMenuRef = useRef<HTMLDivElement | null>(null);
 
-  const [cues, setCues] = useState<SubtitleCue[]>([]);
+  const [tracks, setTracks] = useState<SubtitleTrack[]>([]);
+  const [selectedTrackIdx, setSelectedTrackIdx] = useState<number>(0);
   const [loadingSubs, setLoadingSubs] = useState(false);
   const [activeLines, setActiveLines] = useState<string[]>([]);
   const [styleOpen, setStyleOpen] = useState(false);
   const [subStyle, setSubStyle] = useState<SubtitleStyle>(DEFAULT_SUB_STYLE);
+  const [episodeOffsets, setEpisodeOffsets] = useState<Record<string, number>>(
+    {}
+  );
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPseudoFullscreen, setIsPseudoFullscreen] = useState(false);
 
@@ -95,26 +102,61 @@ export function VideoPlayer({
   const hasEndedMarkedRef = useRef<boolean>(false);
   const lastRenderedKeyRef = useRef<string>("");
 
-  // Client-side cache of fetched subtitle tracks: `${ep}:${lang}` -> cues
-  const cueCacheRef = useRef<Map<string, SubtitleCue[]>>(new Map());
+  // Client-side cache of fetched subtitle track lists: `${ep}:${lang}` -> tracks[]
+  const trackCacheRef = useRef<Map<string, SubtitleTrack[]>>(new Map());
 
   const activeServer = useMemo(
     () => STREAM_SERVERS.find((s) => s.id === serverId) ?? STREAM_SERVERS[0],
     [serverId]
   );
 
-  const embedUrl = useMemo(
-    () => activeServer.buildUrl(episode.number),
-    [activeServer, episode.number]
-  );
+  // Use AnimeEmbed's 100% frame-accurate native stream English captions on Server 1 & 2!
+  const useNativeEnglish =
+    subtitleLang === "en" && activeServer.supportsNativeEn;
 
-  // Load saved subtitle style preferences
+  const activeCues: SubtitleCue[] = useMemo(() => {
+    if (useNativeEnglish || subtitleLang === "off") return [];
+    return tracks[selectedTrackIdx]?.cues ?? tracks[0]?.cues ?? [];
+  }, [tracks, selectedTrackIdx, useNativeEnglish, subtitleLang]);
+
+  const currentOffset = useMemo(() => {
+    const epKey = `${episode.number}:${subtitleLang}:${selectedTrackIdx}`;
+    return episodeOffsets[epKey] ?? subStyle.offset;
+  }, [episodeOffsets, episode.number, subtitleLang, selectedTrackIdx, subStyle.offset]);
+
+  const embedUrl = useMemo(() => {
+    const sizeMap: Record<SubtitleSize, "s" | "m" | "l" | "xl"> = {
+      sm: "s",
+      md: "m",
+      lg: "l",
+      xl: "xl",
+    };
+    return activeServer.buildUrl(episode.number, {
+      nativeEnglish: useNativeEnglish,
+      captionSize: sizeMap[subStyle.size],
+      captionColor: subStyle.color === "yellow" ? "fde047" : "ffffff",
+      captionBg: subStyle.background === "none" ? 0 : 1,
+    });
+  }, [
+    activeServer,
+    episode.number,
+    useNativeEnglish,
+    subStyle.size,
+    subStyle.color,
+    subStyle.background,
+  ]);
+
+  // Load saved subtitle style & per-episode offsets
   useEffect(() => {
     try {
       const saved = localStorage.getItem(SUB_STYLE_STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved) as Partial<SubtitleStyle>;
         setSubStyle((prev) => ({ ...prev, ...parsed }));
+      }
+      const savedOffsets = localStorage.getItem(EP_OFFSET_STORAGE_KEY);
+      if (savedOffsets) {
+        setEpisodeOffsets(JSON.parse(savedOffsets) as Record<string, number>);
       }
     } catch {
       // ignore storage errors
@@ -132,6 +174,22 @@ export function VideoPlayer({
       return next;
     });
   }, []);
+
+  const setTrackOffset = useCallback(
+    (nextVal: number) => {
+      const epKey = `${episode.number}:${subtitleLang}:${selectedTrackIdx}`;
+      setEpisodeOffsets((prev) => {
+        const next = { ...prev, [epKey]: nextVal };
+        try {
+          localStorage.setItem(EP_OFFSET_STORAGE_KEY, JSON.stringify(next));
+        } catch {
+          // ignore
+        }
+        return next;
+      });
+    },
+    [episode.number, subtitleLang, selectedTrackIdx]
+  );
 
   // Close style popover on outside click
   useEffect(() => {
@@ -158,21 +216,23 @@ export function VideoPlayer({
     hasEndedMarkedRef.current = false;
     lastRenderedKeyRef.current = "";
     setActiveLines([]);
-  }, [episode.number, serverId]);
+  }, [episode.number, serverId, useNativeEnglish]);
 
-  // Fetch subtitles for current episode + language (does NOT reload iframe)
+  // Fetch multi-source subtitle tracks when using overlay (Arabic CC, or English CC on Dub)
   useEffect(() => {
-    if (subtitleLang === "off") {
-      setCues([]);
+    if (subtitleLang === "off" || useNativeEnglish) {
+      setTracks([]);
+      setSelectedTrackIdx(0);
       setActiveLines([]);
       setLoadingSubs(false);
       return;
     }
 
     const cacheKey = `${episode.number}:${subtitleLang}`;
-    const cached = cueCacheRef.current.get(cacheKey);
+    const cached = trackCacheRef.current.get(cacheKey);
     if (cached) {
-      setCues(cached);
+      setTracks(cached);
+      setSelectedTrackIdx(0);
       setLoadingSubs(false);
       return;
     }
@@ -180,7 +240,8 @@ export function VideoPlayer({
     let cancelled = false;
     const controller = new AbortController();
     setLoadingSubs(true);
-    setCues([]);
+    setTracks([]);
+    setSelectedTrackIdx(0);
     setActiveLines([]);
 
     fetch(
@@ -188,14 +249,40 @@ export function VideoPlayer({
       { signal: controller.signal }
     )
       .then((res) => (res.ok ? res.json() : null))
-      .then((data: { cues?: SubtitleCue[] } | null) => {
-        if (cancelled) return;
-        const fetched = Array.isArray(data?.cues) ? data.cues : [];
-        cueCacheRef.current.set(cacheKey, fetched);
-        setCues(fetched);
-      })
+      .then(
+        (
+          data: {
+            tracks?: SubtitleTrack[];
+            cues?: SubtitleCue[];
+            source?: string;
+          } | null
+        ) => {
+          if (cancelled) return;
+          let fetchedTracks: SubtitleTrack[] = Array.isArray(data?.tracks)
+            ? data.tracks
+            : [];
+          if (
+            fetchedTracks.length === 0 &&
+            Array.isArray(data?.cues) &&
+            data.cues.length > 0
+          ) {
+            fetchedTracks = [
+              {
+                id: "primary",
+                label: "Track 1",
+                source: data.source ?? "primary",
+                count: data.cues.length,
+                cues: data.cues,
+              },
+            ];
+          }
+          trackCacheRef.current.set(cacheKey, fetchedTracks);
+          setTracks(fetchedTracks);
+          setSelectedTrackIdx(0);
+        }
+      )
       .catch(() => {
-        if (!cancelled) setCues([]);
+        if (!cancelled) setTracks([]);
       })
       .finally(() => {
         if (!cancelled) setLoadingSubs(false);
@@ -205,28 +292,44 @@ export function VideoPlayer({
       cancelled = true;
       controller.abort();
     };
-  }, [episode.number, subtitleLang]);
+  }, [episode.number, subtitleLang, useNativeEnglish]);
 
-  // Listen to AnimeEmbed postMessage events (channel: 'animeembed', version: 1)
+  // Resilient AnimeEmbed postMessage listener (accepts animeembed.com & subdomains + all time fields)
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       const frame = iframeRef.current;
       if (!frame || event.source !== frame.contentWindow) return;
 
       try {
-        const expectedOrigin = new URL(embedUrl).origin;
-        if (event.origin !== expectedOrigin) return;
+        const host = new URL(event.origin).hostname.toLowerCase();
+        if (host !== "animeembed.com" && !host.endsWith(".animeembed.com")) {
+          return;
+        }
       } catch {
         return;
       }
 
-      const msg = event.data as {
+      const raw = event.data;
+      const msg = (
+        typeof raw === "string"
+          ? (() => {
+              try {
+                return JSON.parse(raw);
+              } catch {
+                return null;
+              }
+            })()
+          : raw
+      ) as {
         channel?: string;
         version?: number;
         event?: string;
+        currentTime?: number;
+        time?: number;
         data?: {
           time?: number;
           currentTime?: number;
+          seconds?: number;
           position?: number;
           duration?: number;
           speed?: number;
@@ -236,23 +339,30 @@ export function VideoPlayer({
         };
       } | null;
 
-      if (!msg || msg.channel !== "animeembed" || msg.version !== 1) return;
+      if (!msg || msg.channel !== "animeembed") return;
 
       const now = performance.now();
+      const d = msg.data ?? {};
       const reportedTime =
-        typeof msg.data?.currentTime === "number"
-          ? msg.data.currentTime
-          : typeof msg.data?.time === "number"
-          ? msg.data.time
-          : typeof msg.data?.position === "number"
-          ? msg.data.position
+        typeof d.currentTime === "number"
+          ? d.currentTime
+          : typeof d.time === "number"
+          ? d.time
+          : typeof d.seconds === "number"
+          ? d.seconds
+          : typeof d.position === "number"
+          ? d.position
+          : typeof msg.currentTime === "number"
+          ? msg.currentTime
+          : typeof msg.time === "number"
+          ? msg.time
           : null;
 
       const reportedRate =
-        typeof msg.data?.playbackRate === "number" && msg.data.playbackRate > 0
-          ? msg.data.playbackRate
-          : typeof msg.data?.speed === "number" && msg.data.speed > 0
-          ? msg.data.speed
+        typeof d.playbackRate === "number" && d.playbackRate > 0
+          ? d.playbackRate
+          : typeof d.speed === "number" && d.speed > 0
+          ? d.speed
           : null;
 
       if (reportedRate !== null) {
@@ -265,14 +375,13 @@ export function VideoPlayer({
         case "seeked": {
           if (reportedTime !== null && Number.isFinite(reportedTime)) {
             const prevReported = lastReportedTimeRef.current;
-            // If progress is advancing forward after buffering/start, ensure clock runs smoothly
-            if (msg.data?.paused === true) {
+            if (d.paused === true) {
               isPlayingRef.current = false;
             } else if (
-              msg.data?.playing === true ||
+              d.playing === true ||
               (prevReported >= 0 &&
                 reportedTime > prevReported + 0.01 &&
-                reportedTime - prevReported < 3.0)
+                reportedTime - prevReported < 3.5)
             ) {
               isPlayingRef.current = true;
             }
@@ -284,9 +393,9 @@ export function VideoPlayer({
           if (
             !hasEndedMarkedRef.current &&
             reportedTime !== null &&
-            typeof msg.data?.duration === "number" &&
-            msg.data.duration > 60 &&
-            reportedTime / msg.data.duration >= 0.85
+            typeof d.duration === "number" &&
+            d.duration > 60 &&
+            reportedTime / d.duration >= 0.85
           ) {
             hasEndedMarkedRef.current = true;
             onAutoMarkWatched();
@@ -333,11 +442,11 @@ export function VideoPlayer({
 
     window.addEventListener("message", handleMessage);
     return () => window.removeEventListener("message", handleMessage);
-  }, [embedUrl, onAutoMarkWatched]);
+  }, [onAutoMarkWatched]);
 
   // Smooth requestAnimationFrame subtitle sync loop (zero drift + stall-clamped)
   useEffect(() => {
-    if (subtitleLang === "off" || cues.length === 0) {
+    if (useNativeEnglish || subtitleLang === "off" || activeCues.length === 0) {
       lastRenderedKeyRef.current = "";
       setActiveLines([]);
       return;
@@ -346,7 +455,6 @@ export function VideoPlayer({
     let rafId = 0;
 
     const tick = () => {
-      // Clamp extrapolation between progress heartbeats to 2.0s so a silent stall/pause never drifts ahead
       const rawElapsed = isPlayingRef.current
         ? (performance.now() - anchorPerfTimeRef.current) / 1000
         : 0;
@@ -354,9 +462,9 @@ export function VideoPlayer({
       const videoTime =
         anchorVideoTimeRef.current +
         clampedElapsed * playbackRateRef.current +
-        subStyle.offset;
+        currentOffset;
 
-      const matched = findActiveCues(cues, videoTime);
+      const matched = findActiveCues(activeCues, videoTime);
       const nextLines = matched.map((c) => c.text);
       const key = nextLines.join("\n---\n");
 
@@ -370,7 +478,7 @@ export function VideoPlayer({
 
     rafId = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(rafId);
-  }, [cues, subtitleLang, subStyle.offset]);
+  }, [activeCues, subtitleLang, useNativeEnglish, currentOffset]);
 
   // Track native fullscreen changes
   useEffect(() => {
@@ -554,7 +662,7 @@ export function VideoPlayer({
       >
         <iframe
           ref={iframeRef}
-          key={`${episode.number}-${serverId}`}
+          key={`${episode.number}-${serverId}-${useNativeEnglish ? "native-en" : "overlay"}`}
           src={embedUrl}
           title={`Dororo Episode ${episode.number}: ${episode.title}`}
           className="h-full w-full border-0"
@@ -576,28 +684,30 @@ export function VideoPlayer({
           </button>
         )}
 
-        {/* Synced Arabic / English Subtitle Overlay */}
-        {subtitleLang !== "off" && activeLines.length > 0 && (
-          <div
-            className={`pointer-events-none absolute inset-x-0 z-20 flex flex-col items-center justify-end gap-1 px-4 sm:px-8 text-center ${positionClass}`}
-          >
-            {activeLines.map((cueText, idx) => (
-              <div
-                key={`${idx}-${cueText.slice(0, 16)}`}
-                dir={isArabic ? "rtl" : "ltr"}
-                style={{
-                  unicodeBidi: isArabic ? "isolate" : "normal",
-                  lineHeight: isArabic ? 1.45 : 1.35,
-                }}
-                className={`max-w-[92%] sm:max-w-[82%] whitespace-pre-line font-semibold tracking-normal ${
-                  isArabic ? "font-arabic" : "font-sans"
-                } ${sizeClass} ${bgClass} ${colorClass}`}
-              >
-                {cueText}
-              </div>
-            ))}
-          </div>
-        )}
+        {/* Synced Arabic (or Dub English) Subtitle Overlay */}
+        {!useNativeEnglish &&
+          subtitleLang !== "off" &&
+          activeLines.length > 0 && (
+            <div
+              className={`pointer-events-none absolute inset-x-0 z-20 flex flex-col items-center justify-end gap-1 px-4 sm:px-8 text-center ${positionClass}`}
+            >
+              {activeLines.map((cueText, idx) => (
+                <div
+                  key={`${idx}-${cueText.slice(0, 16)}`}
+                  dir={isArabic ? "rtl" : "ltr"}
+                  style={{
+                    unicodeBidi: isArabic ? "isolate" : "normal",
+                    lineHeight: isArabic ? 1.45 : 1.35,
+                  }}
+                  className={`max-w-[92%] sm:max-w-[82%] whitespace-pre-line font-semibold tracking-normal ${
+                    isArabic ? "font-arabic" : "font-sans"
+                  } ${sizeClass} ${bgClass} ${colorClass}`}
+                >
+                  {cueText}
+                </div>
+              ))}
+            </div>
+          )}
       </div>
 
       {/* Unified Control Deck Below Video */}
@@ -640,7 +750,7 @@ export function VideoPlayer({
             })}
           </div>
 
-          {/* Right: Arabic CC / English CC / Off + Style Popover */}
+          {/* Right: Arabic CC / English CC / Off + Track Switcher + Style Popover */}
           <div className="flex flex-wrap items-center gap-2">
             <span className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 mr-1">
               <Subtitles className="h-3.5 w-3.5 text-vermilion" />
@@ -680,6 +790,27 @@ export function VideoPlayer({
               />
             )}
 
+            {/* Instant Multi-Track Switcher (when multiple subtitle sources are available) */}
+            {!useNativeEnglish &&
+              subtitleLang !== "off" &&
+              tracks.length > 1 && (
+                <div className="relative inline-flex items-center">
+                  <Layers className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-zinc-400" />
+                  <select
+                    aria-label="Subtitle Track"
+                    value={selectedTrackIdx}
+                    onChange={(e) => setSelectedTrackIdx(Number(e.target.value))}
+                    className="rounded-lg border border-hairline bg-obsidian py-1.5 pl-7 pr-6 text-xs font-medium text-zinc-200 focus:border-vermilion focus:outline-none"
+                  >
+                    {tracks.map((t, idx) => (
+                      <option key={t.id} value={idx} className="bg-charcoal">
+                        {t.label} ({t.count})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
             {/* Subtitle Style & Sync Popover */}
             <div ref={styleMenuRef} className="relative">
               <button
@@ -703,7 +834,10 @@ export function VideoPlayer({
                     </span>
                     <button
                       type="button"
-                      onClick={() => updateSubStyle(DEFAULT_SUB_STYLE)}
+                      onClick={() => {
+                        updateSubStyle(DEFAULT_SUB_STYLE);
+                        setTrackOffset(0);
+                      }}
                       className="inline-flex items-center gap-1 text-[11px] text-zinc-400 hover:text-white"
                     >
                       <RotateCcw className="h-3 w-3" />
@@ -828,48 +962,49 @@ export function VideoPlayer({
                     </div>
                   </div>
 
-                  {/* Timing Sync */}
-                  <div className="mt-3">
-                    <div className="flex items-center justify-between text-[11px]">
-                      <span className="font-medium text-zinc-400">
-                        Timing Sync
-                      </span>
-                      <span className="font-mono text-zinc-200">
-                        {subStyle.offset > 0
-                          ? `+${subStyle.offset.toFixed(2)}s`
-                          : `${subStyle.offset.toFixed(2)}s`}
-                      </span>
-                    </div>
-                    <div className="mt-1.5 grid grid-cols-5 gap-1">
-                      {(
-                        [
-                          { delta: -1, label: "-1s" },
-                          { delta: -0.25, label: "-.25" },
-                          { delta: 0, label: "0.0" },
-                          { delta: 0.25, label: "+.25" },
-                          { delta: 1, label: "+1s" },
-                        ] as const
-                      ).map((btn) => (
-                        <button
-                          key={btn.label}
-                          type="button"
-                          onClick={() =>
-                            updateSubStyle({
-                              offset:
+                  {/* Timing Sync (for overlay tracks) */}
+                  {!useNativeEnglish && subtitleLang !== "off" && (
+                    <div className="mt-3">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="font-medium text-zinc-400">
+                          Timing Sync (Ep {episode.number})
+                        </span>
+                        <span className="font-mono text-zinc-200">
+                          {currentOffset > 0
+                            ? `+${currentOffset.toFixed(2)}s`
+                            : `${currentOffset.toFixed(2)}s`}
+                        </span>
+                      </div>
+                      <div className="mt-1.5 grid grid-cols-5 gap-1">
+                        {(
+                          [
+                            { delta: -1, label: "-1s" },
+                            { delta: -0.25, label: "-.25" },
+                            { delta: 0, label: "0.0" },
+                            { delta: 0.25, label: "+.25" },
+                            { delta: 1, label: "+1s" },
+                          ] as const
+                        ).map((btn) => (
+                          <button
+                            key={btn.label}
+                            type="button"
+                            onClick={() =>
+                              setTrackOffset(
                                 btn.delta === 0
                                   ? 0
                                   : Number(
-                                      (subStyle.offset + btn.delta).toFixed(2)
-                                    ),
-                            })
-                          }
-                          className="rounded-md border border-hairline bg-obsidian py-1 text-[11px] font-mono text-zinc-300 hover:border-zinc-700 hover:text-white"
-                        >
-                          {btn.label}
-                        </button>
-                      ))}
+                                      (currentOffset + btn.delta).toFixed(2)
+                                    )
+                              )
+                            }
+                            className="rounded-md border border-hairline bg-obsidian py-1 text-[11px] font-mono text-zinc-300 hover:border-zinc-700 hover:text-white"
+                          >
+                            {btn.label}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                  </div>
+                  )}
                 </div>
               )}
             </div>
