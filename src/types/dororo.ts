@@ -52,12 +52,32 @@ export interface SubtitleCue {
   text: string;
 }
 
-export interface SubtitleTrack {
+export type ReleaseSourceType = "WEB" | "AMZN" | "Blu-ray" | "TV" | "Unknown";
+
+export interface SubtitleCandidateMeta {
   id: string;
   label: string;
-  source: string;
-  count: number;
+  releaseName: string;
+  releaseGroup: string;
+  sourceType: ReleaseSourceType;
+  provider: "subdl" | "opensubtitles";
+  isHumanCreated: boolean;
+  isHearingImpaired: boolean;
+  compatibilityScore: number;
+  loaded: boolean;
+  cueCount?: number;
+}
+
+export interface SubtitleTrackResponse {
+  episode: number;
+  lang: "ar" | "en";
+  server: ServerId;
+  provider: string;
+  selectedTrackId: string | null;
+  selectedReleaseName: string | null;
   cues: SubtitleCue[];
+  candidates: SubtitleCandidateMeta[];
+  warning?: string;
 }
 
 export type SubtitleSize = "sm" | "md" | "lg" | "xl";
@@ -70,7 +90,7 @@ export interface SubtitleStyle {
   background: SubtitleBackground;
   color: SubtitleColor;
   position: SubtitlePosition;
-  offset: number; // seconds, e.g. -0.5, 0, +0.5
+  offset: number;
 }
 
 export interface WatchState {

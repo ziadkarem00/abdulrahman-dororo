@@ -23,18 +23,20 @@ import type {
   Episode,
   ServerId,
   SubtitleBackground,
+  SubtitleCandidateMeta,
   SubtitleColor,
   SubtitleCue,
   SubtitleLang,
   SubtitlePosition,
   SubtitleSize,
   SubtitleStyle,
-  SubtitleTrack,
+  SubtitleTrackResponse,
 } from "@/types/dororo";
 
 const SUB_STYLE_STORAGE_KEY = "abdulrahman_dororo_sub_style_v1";
-const SYNC_OFFSET_STORAGE_KEY = "abdulrahman_dororo_sync_offset_v1";
-const SUB_CACHE_VERSION = "5";
+const SYNC_OFFSET_STORAGE_KEY = "abdulrahman_dororo_sync_offsets_v2";
+const TRACK_PREF_STORAGE_KEY = "abdulrahman_dororo_track_prefs_v2";
+export const SUB_CACHE_VERSION = "6";
 
 const DEFAULT_SUB_STYLE: SubtitleStyle = {
   size: "md",
@@ -81,60 +83,57 @@ export function VideoPlayer({
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const styleMenuRef = useRef<HTMLDivElement | null>(null);
 
-  const [tracks, setTracks] = useState<SubtitleTrack[]>([]);
-  // "native" uses AnimeEmbed's stream-native English track (default on Server 1 & 2);
-  // numeric index selects one of the up-to-3 external tracks ("Arabic 1/2/3" or "English 1/2/3")
-  const [selectedTrackKey, setSelectedTrackKey] = useState<string>("0");
+  const [candidates, setCandidates] = useState<SubtitleCandidateMeta[]>([]);
+  const [selectedTrackId, setSelectedTrackId] = useState<string>("");
+  const [selectedReleaseName, setSelectedReleaseName] = useState<string | null>(
+    null
+  );
+  const [rawCues, setRawCues] = useState<SubtitleCue[]>([]);
   const [loadingSubs, setLoadingSubs] = useState(false);
   const [activeLines, setActiveLines] = useState<string[]>([]);
   const [styleOpen, setStyleOpen] = useState(false);
   const [subStyle, setSubStyle] = useState<SubtitleStyle>(DEFAULT_SUB_STYLE);
-  const [syncOffset, setSyncOffset] = useState<number>(0);
+  const [syncOffsets, setSyncOffsets] = useState<Record<string, number>>({});
+  const [trackPrefs, setTrackPrefs] = useState<Record<string, string>>({});
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPseudoFullscreen, setIsPseudoFullscreen] = useState(false);
 
-  // Zero-drift performance.now() playback clock anchored to AnimeEmbed postMessage events
+  // PHASE 3: Continuous performance.now() playback clock anchored to official AnimeEmbed events
+  // (ready, play, pause, buffering, progress, ended) — NO artificial 2-second cap.
   const anchorVideoTimeRef = useRef<number>(0);
   const anchorPerfTimeRef = useRef<number>(0);
-  const lastReportedTimeRef = useRef<number>(-1);
+  const lastProgressTimeRef = useRef<number>(-1);
   const playbackRateRef = useRef<number>(1);
   const isPlayingRef = useRef<boolean>(false);
   const hasEndedMarkedRef = useRef<boolean>(false);
   const lastRenderedKeyRef = useRef<string>("");
 
-  const trackCacheRef = useRef<Map<string, SubtitleTrack[]>>(new Map());
+  // Client cache keyed by `${ep}:${lang}:${server}:${trackId || "auto"}`
+  const responseCacheRef = useRef<Map<string, SubtitleTrackResponse>>(
+    new Map()
+  );
 
   const activeServer = useMemo(
     () => STREAM_SERVERS.find((s) => s.id === serverId) ?? STREAM_SERVERS[0],
     [serverId]
   );
 
-  // Default English on Server 1 & 2 to stream-native captions first; user can also pick English 1/2/3
-  useEffect(() => {
-    if (subtitleLang === "en" && activeServer.supportsNativeEn) {
-      setSelectedTrackKey("native");
-    } else {
-      setSelectedTrackKey("0");
-    }
-  }, [subtitleLang, activeServer.supportsNativeEn, episode.number]);
+  // Unique context key per (episode, server, language) so each combination keeps its own release & offset
+  const contextKey = `${episode.number}:${serverId}:${subtitleLang}`;
+  const currentOffset = syncOffsets[contextKey] ?? 0;
 
-  const useNativeEnglish =
+  // PHASE 2: Both Arabic & English use validated external SubDL tracks by default across all 3 servers.
+  // Native AnimeEmbed English captions remain an optional fallback ("native-fallback").
+  const useNativeEnglishFallback =
     subtitleLang === "en" &&
     activeServer.supportsNativeEn &&
-    selectedTrackKey === "native";
+    selectedTrackId === "native-fallback";
 
-  const rawOverlayCues: SubtitleCue[] = useMemo(() => {
-    if (useNativeEnglish || subtitleLang === "off") return [];
-    const idx = Number(selectedTrackKey);
-    const chosen = Number.isFinite(idx) ? tracks[idx] : tracks[0];
-    return chosen?.cues ?? tracks[0]?.cues ?? [];
-  }, [tracks, selectedTrackKey, useNativeEnglish, subtitleLang]);
-
-  // Dynamically shift every cue's startTime & endTime (clamped >= 0) in real time without reloading video
-  const shiftedCues: SubtitleCue[] = useMemo(
-    () => shiftSubtitleCues(rawOverlayCues, syncOffset),
-    [rawOverlayCues, syncOffset]
-  );
+  // Dynamically shift cue timestamps (clamped >= 0) without reloading the video
+  const shiftedCues: SubtitleCue[] = useMemo(() => {
+    if (useNativeEnglishFallback || subtitleLang === "off") return [];
+    return shiftSubtitleCues(rawCues, currentOffset);
+  }, [rawCues, currentOffset, useNativeEnglishFallback, subtitleLang]);
 
   const embedUrl = useMemo(() => {
     const sizeMap: Record<SubtitleSize, "s" | "m" | "l" | "xl"> = {
@@ -144,7 +143,7 @@ export function VideoPlayer({
       xl: "xl",
     };
     return activeServer.buildUrl(episode.number, {
-      nativeEnglish: useNativeEnglish,
+      nativeEnglish: useNativeEnglishFallback,
       captionSize: sizeMap[subStyle.size],
       captionColor: subStyle.color === "yellow" ? "fde047" : "ffffff",
       captionBg: subStyle.background === "none" ? 0 : 1,
@@ -152,26 +151,29 @@ export function VideoPlayer({
   }, [
     activeServer,
     episode.number,
-    useNativeEnglish,
+    useNativeEnglishFallback,
     subStyle.size,
     subStyle.color,
     subStyle.background,
   ]);
 
-  // Load saved subtitle style & persisted sync offset from localStorage
+  // Hydrate saved style, per-context sync offsets, and per-context preferred track IDs
   useEffect(() => {
     try {
-      const saved = localStorage.getItem(SUB_STYLE_STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved) as Partial<SubtitleStyle>;
-        setSubStyle((prev) => ({ ...prev, ...parsed }));
+      const savedStyle = localStorage.getItem(SUB_STYLE_STORAGE_KEY);
+      if (savedStyle) {
+        setSubStyle((prev) => ({
+          ...prev,
+          ...(JSON.parse(savedStyle) as Partial<SubtitleStyle>),
+        }));
       }
-      const savedOffset = localStorage.getItem(SYNC_OFFSET_STORAGE_KEY);
-      if (savedOffset !== null) {
-        const num = Number(savedOffset);
-        if (Number.isFinite(num)) {
-          setSyncOffset(num);
-        }
+      const savedOffsets = localStorage.getItem(SYNC_OFFSET_STORAGE_KEY);
+      if (savedOffsets) {
+        setSyncOffsets(JSON.parse(savedOffsets) as Record<string, number>);
+      }
+      const savedTracks = localStorage.getItem(TRACK_PREF_STORAGE_KEY);
+      if (savedTracks) {
+        setTrackPrefs(JSON.parse(savedTracks) as Record<string, string>);
       }
     } catch {
       // ignore storage errors
@@ -184,21 +186,43 @@ export function VideoPlayer({
       try {
         localStorage.setItem(SUB_STYLE_STORAGE_KEY, JSON.stringify(next));
       } catch {
-        // ignore storage errors
+        // ignore
       }
       return next;
     });
   }, []);
 
-  const updateSyncOffset = useCallback((nextVal: number) => {
-    const rounded = Number(nextVal.toFixed(1));
-    setSyncOffset(rounded);
-    try {
-      localStorage.setItem(SYNC_OFFSET_STORAGE_KEY, String(rounded));
-    } catch {
-      // ignore storage errors
-    }
-  }, []);
+  const updateSyncOffset = useCallback(
+    (nextVal: number) => {
+      const rounded = Number(nextVal.toFixed(1));
+      setSyncOffsets((prev) => {
+        const next = { ...prev, [contextKey]: rounded };
+        try {
+          localStorage.setItem(SYNC_OFFSET_STORAGE_KEY, JSON.stringify(next));
+        } catch {
+          // ignore
+        }
+        return next;
+      });
+    },
+    [contextKey]
+  );
+
+  const handleTrackChange = useCallback(
+    (trackId: string) => {
+      setSelectedTrackId(trackId);
+      setTrackPrefs((prev) => {
+        const next = { ...prev, [contextKey]: trackId };
+        try {
+          localStorage.setItem(TRACK_PREF_STORAGE_KEY, JSON.stringify(next));
+        } catch {
+          // ignore
+        }
+        return next;
+      });
+    },
+    [contextKey]
+  );
 
   // Close style popover on outside click
   useEffect(() => {
@@ -215,79 +239,87 @@ export function VideoPlayer({
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, [styleOpen]);
 
-  // Reset clock when episode, server, or native-vs-overlay iframe mode changes
+  // Reset track selection & playback clock cleanly when switching episodes, servers, or language
+  useEffect(() => {
+    const savedPref = trackPrefs[contextKey] ?? "";
+    setSelectedTrackId(savedPref);
+    setSelectedReleaseName(null);
+    setCandidates([]);
+    setRawCues([]);
+    setActiveLines([]);
+    lastRenderedKeyRef.current = "";
+  }, [episode.number, serverId, subtitleLang, contextKey, trackPrefs]);
+
   useEffect(() => {
     anchorVideoTimeRef.current = 0;
     anchorPerfTimeRef.current = performance.now();
-    lastReportedTimeRef.current = -1;
+    lastProgressTimeRef.current = -1;
     playbackRateRef.current = 1;
     isPlayingRef.current = false;
     hasEndedMarkedRef.current = false;
     lastRenderedKeyRef.current = "";
     setActiveLines([]);
-  }, [episode.number, serverId, useNativeEnglish]);
+  }, [episode.number, serverId, useNativeEnglishFallback]);
 
-  // Fetch up to 3 external tracks per language (Wyzie TMDB 83100 + fallbacks)
+  // Fetch validated external subtitles from SubDL v2 API route (for BOTH Arabic and English)
   useEffect(() => {
-    if (subtitleLang === "off") {
-      setTracks([]);
+    if (subtitleLang === "off" || useNativeEnglishFallback) {
+      setRawCues([]);
       setActiveLines([]);
       setLoadingSubs(false);
       return;
     }
 
-    const cacheKey = `${episode.number}:${subtitleLang}`;
-    const cached = trackCacheRef.current.get(cacheKey);
+    const reqTrack =
+      selectedTrackId && selectedTrackId !== "native-fallback"
+        ? selectedTrackId
+        : "";
+    const cacheKey = `${episode.number}:${subtitleLang}:${serverId}:${
+      reqTrack || "auto"
+    }`;
+
+    const cached = responseCacheRef.current.get(cacheKey);
     if (cached) {
-      setTracks(cached);
+      setCandidates(cached.candidates);
+      setRawCues(cached.cues);
+      setSelectedReleaseName(cached.selectedReleaseName);
+      if (cached.selectedTrackId && !reqTrack) {
+        setSelectedTrackId(cached.selectedTrackId);
+      }
       setLoadingSubs(false);
       return;
     }
 
     let cancelled = false;
     const controller = new AbortController();
-    setLoadingSubs(!useNativeEnglish);
-    setTracks([]);
+    setLoadingSubs(true);
     setActiveLines([]);
 
-    fetch(
-      `/api/subtitles?ep=${episode.number}&lang=${subtitleLang}&v=${SUB_CACHE_VERSION}`,
-      { signal: controller.signal }
-    )
+    const params = new URLSearchParams({
+      ep: String(episode.number),
+      lang: subtitleLang,
+      server: serverId,
+      v: SUB_CACHE_VERSION,
+    });
+    if (reqTrack) params.set("trackId", reqTrack);
+
+    fetch(`/api/subtitles?${params.toString()}`, { signal: controller.signal })
       .then((res) => (res.ok ? res.json() : null))
-      .then(
-        (
-          data: {
-            tracks?: SubtitleTrack[];
-            cues?: SubtitleCue[];
-            source?: string;
-          } | null
-        ) => {
-          if (cancelled) return;
-          let fetchedTracks: SubtitleTrack[] = Array.isArray(data?.tracks)
-            ? data.tracks
-            : [];
-          if (
-            fetchedTracks.length === 0 &&
-            Array.isArray(data?.cues) &&
-            data.cues.length > 0
-          ) {
-            fetchedTracks = [
-              {
-                id: "primary",
-                label: subtitleLang === "ar" ? "Arabic 1" : "English 1",
-                source: data.source ?? "primary",
-                count: data.cues.length,
-                cues: data.cues,
-              },
-            ];
-          }
-          trackCacheRef.current.set(cacheKey, fetchedTracks);
-          setTracks(fetchedTracks);
+      .then((data: SubtitleTrackResponse | null) => {
+        if (cancelled || !data) return;
+        responseCacheRef.current.set(cacheKey, data);
+        setCandidates(Array.isArray(data.candidates) ? data.candidates : []);
+        setRawCues(Array.isArray(data.cues) ? data.cues : []);
+        setSelectedReleaseName(data.selectedReleaseName ?? null);
+        if (data.selectedTrackId && !reqTrack) {
+          setSelectedTrackId(data.selectedTrackId);
         }
-      )
+      })
       .catch(() => {
-        if (!cancelled) setTracks([]);
+        if (!cancelled) {
+          setRawCues([]);
+          setSelectedReleaseName(null);
+        }
       })
       .finally(() => {
         if (!cancelled) setLoadingSubs(false);
@@ -297,44 +329,35 @@ export function VideoPlayer({
       cancelled = true;
       controller.abort();
     };
-  }, [episode.number, subtitleLang, useNativeEnglish]);
+  }, [
+    episode.number,
+    subtitleLang,
+    serverId,
+    selectedTrackId,
+    useNativeEnglishFallback,
+  ]);
 
-  // Resilient AnimeEmbed postMessage listener
+  // PHASE 3: Official AnimeEmbed JavaScript API listener (ready, play, pause, buffering, progress, ended)
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       const frame = iframeRef.current;
       if (!frame || event.source !== frame.contentWindow) return;
 
+      // Strict origin verification against the iframe's actual src origin
       try {
-        const host = new URL(event.origin).hostname.toLowerCase();
-        if (host !== "animeembed.com" && !host.endsWith(".animeembed.com")) {
-          return;
-        }
+        const expectedOrigin = new URL(frame.src).origin;
+        if (event.origin !== expectedOrigin) return;
       } catch {
         return;
       }
 
-      const raw = event.data;
-      const msg = (
-        typeof raw === "string"
-          ? (() => {
-              try {
-                return JSON.parse(raw);
-              } catch {
-                return null;
-              }
-            })()
-          : raw
-      ) as {
+      const msg = event.data as {
         channel?: string;
         version?: number;
         event?: string;
-        currentTime?: number;
-        time?: number;
         data?: {
           time?: number;
           currentTime?: number;
-          seconds?: number;
           position?: number;
           duration?: number;
           speed?: number;
@@ -344,73 +367,62 @@ export function VideoPlayer({
         };
       } | null;
 
-      if (!msg || msg.channel !== "animeembed") return;
+      if (!msg || msg.channel !== "animeembed" || msg.version !== 1) return;
 
       const now = performance.now();
       const d = msg.data ?? {};
-      const reportedTime =
+
+      // Extract time in seconds (guard against millisecond payloads if ever encountered)
+      const rawTime =
         typeof d.currentTime === "number"
           ? d.currentTime
           : typeof d.time === "number"
           ? d.time
-          : typeof d.seconds === "number"
-          ? d.seconds
           : typeof d.position === "number"
           ? d.position
-          : typeof msg.currentTime === "number"
-          ? msg.currentTime
-          : typeof msg.time === "number"
-          ? msg.time
           : null;
 
-      const reportedRate =
+      const duration =
+        typeof d.duration === "number" && d.duration > 0 ? d.duration : null;
+
+      const reportedTime =
+        rawTime !== null && Number.isFinite(rawTime)
+          ? duration && rawTime > duration * 10
+            ? rawTime / 1000
+            : rawTime > 100000
+            ? rawTime / 1000
+            : rawTime
+          : null;
+
+      const rate =
         typeof d.playbackRate === "number" && d.playbackRate > 0
           ? d.playbackRate
           : typeof d.speed === "number" && d.speed > 0
           ? d.speed
           : null;
 
-      if (reportedRate !== null) {
-        playbackRateRef.current = reportedRate;
+      if (rate !== null) {
+        // Re-anchor current computed time before changing playback rate so speed changes never jump
+        if (isPlayingRef.current) {
+          anchorVideoTimeRef.current +=
+            ((now - anchorPerfTimeRef.current) / 1000) * playbackRateRef.current;
+          anchorPerfTimeRef.current = now;
+        }
+        playbackRateRef.current = rate;
       }
 
       switch (msg.event) {
-        case "progress":
-        case "timeupdate":
-        case "seeked": {
-          if (reportedTime !== null && Number.isFinite(reportedTime)) {
-            const prevReported = lastReportedTimeRef.current;
-            if (d.paused === true) {
-              isPlayingRef.current = false;
-            } else if (
-              d.playing === true ||
-              (prevReported >= 0 &&
-                reportedTime > prevReported + 0.01 &&
-                reportedTime - prevReported < 3.5)
-            ) {
-              isPlayingRef.current = true;
-            }
-
-            anchorVideoTimeRef.current = reportedTime;
-            anchorPerfTimeRef.current = now;
-            lastReportedTimeRef.current = reportedTime;
-          }
-          if (
-            !hasEndedMarkedRef.current &&
-            reportedTime !== null &&
-            typeof d.duration === "number" &&
-            d.duration > 60 &&
-            reportedTime / d.duration >= 0.85
-          ) {
-            hasEndedMarkedRef.current = true;
-            onAutoMarkWatched();
-          }
+        case "ready": {
+          anchorVideoTimeRef.current = reportedTime ?? 0;
+          anchorPerfTimeRef.current = now;
+          lastProgressTimeRef.current = reportedTime ?? 0;
+          isPlayingRef.current = false;
           break;
         }
         case "play": {
-          if (reportedTime !== null && Number.isFinite(reportedTime)) {
+          if (reportedTime !== null) {
             anchorVideoTimeRef.current = reportedTime;
-            lastReportedTimeRef.current = reportedTime;
+            lastProgressTimeRef.current = reportedTime;
           }
           anchorPerfTimeRef.current = now;
           isPlayingRef.current = true;
@@ -418,22 +430,54 @@ export function VideoPlayer({
         }
         case "pause":
         case "buffering": {
-          if (reportedTime !== null && Number.isFinite(reportedTime)) {
+          if (reportedTime !== null) {
             anchorVideoTimeRef.current = reportedTime;
-            lastReportedTimeRef.current = reportedTime;
+            lastProgressTimeRef.current = reportedTime;
           } else if (isPlayingRef.current) {
-            const delta = Math.min(
-              2.0,
-              (now - anchorPerfTimeRef.current) / 1000
-            );
-            anchorVideoTimeRef.current += delta * playbackRateRef.current;
+            anchorVideoTimeRef.current +=
+              ((now - anchorPerfTimeRef.current) / 1000) *
+              playbackRateRef.current;
           }
           anchorPerfTimeRef.current = now;
           isPlayingRef.current = false;
           break;
         }
+        case "progress": {
+          if (reportedTime !== null) {
+            const prevProgress = lastProgressTimeRef.current;
+            // Re-anchor directly to authoritative player media time on every progress tick (zero long-session drift & instant seek handling)
+            anchorVideoTimeRef.current = reportedTime;
+            anchorPerfTimeRef.current = now;
+            lastProgressTimeRef.current = reportedTime;
+
+            if (d.paused === true) {
+              isPlayingRef.current = false;
+            } else if (
+              d.playing === true ||
+              (prevProgress >= 0 && reportedTime > prevProgress + 0.01)
+            ) {
+              isPlayingRef.current = true;
+            }
+          }
+
+          if (
+            !hasEndedMarkedRef.current &&
+            reportedTime !== null &&
+            duration !== null &&
+            duration > 60 &&
+            reportedTime / duration >= 0.85
+          ) {
+            hasEndedMarkedRef.current = true;
+            onAutoMarkWatched();
+          }
+          break;
+        }
         case "ended": {
           isPlayingRef.current = false;
+          if (reportedTime !== null) {
+            anchorVideoTimeRef.current = reportedTime;
+            anchorPerfTimeRef.current = now;
+          }
           if (!hasEndedMarkedRef.current) {
             hasEndedMarkedRef.current = true;
             onAutoMarkWatched();
@@ -449,10 +493,10 @@ export function VideoPlayer({
     return () => window.removeEventListener("message", handleMessage);
   }, [onAutoMarkWatched]);
 
-  // Smooth requestAnimationFrame subtitle sync loop using dynamically shifted cues
+  // Continuous drift-free requestAnimationFrame subtitle clock (stops only on pause/buffering/ended)
   useEffect(() => {
     if (
-      useNativeEnglish ||
+      useNativeEnglishFallback ||
       subtitleLang === "off" ||
       shiftedCues.length === 0
     ) {
@@ -464,12 +508,11 @@ export function VideoPlayer({
     let rafId = 0;
 
     const tick = () => {
-      const rawElapsed = isPlayingRef.current
-        ? (performance.now() - anchorPerfTimeRef.current) / 1000
+      const elapsed = isPlayingRef.current
+        ? Math.max(0, (performance.now() - anchorPerfTimeRef.current) / 1000)
         : 0;
-      const clampedElapsed = Math.min(2.0, Math.max(0, rawElapsed));
       const videoTime =
-        anchorVideoTimeRef.current + clampedElapsed * playbackRateRef.current;
+        anchorVideoTimeRef.current + elapsed * playbackRateRef.current;
 
       const matched = findActiveCues(shiftedCues, videoTime);
       const nextLines = matched.map((c) => c.text);
@@ -485,7 +528,7 @@ export function VideoPlayer({
 
     rafId = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(rafId);
-  }, [shiftedCues, subtitleLang, useNativeEnglish]);
+  }, [shiftedCues, subtitleLang, useNativeEnglishFallback]);
 
   // Track native fullscreen changes
   useEffect(() => {
@@ -605,13 +648,13 @@ export function VideoPlayer({
   const isArabic = subtitleLang === "ar";
   const showTrackPicker =
     subtitleLang !== "off" &&
-    (tracks.length > 1 ||
-      (subtitleLang === "en" &&
-        activeServer.supportsNativeEn &&
-        tracks.length > 0));
+    (candidates.length > 0 ||
+      (subtitleLang === "en" && activeServer.supportsNativeEn));
 
   const formattedOffset =
-    syncOffset > 0 ? `+${syncOffset.toFixed(1)}s` : `${syncOffset.toFixed(1)}s`;
+    currentOffset > 0
+      ? `+${currentOffset.toFixed(1)}s`
+      : `${currentOffset.toFixed(1)}s`;
 
   return (
     <section
@@ -679,7 +722,7 @@ export function VideoPlayer({
         <iframe
           ref={iframeRef}
           key={`${episode.number}-${serverId}-${
-            useNativeEnglish ? "native-en" : "overlay"
+            useNativeEnglishFallback ? "native-en" : "custom-sub"
           }`}
           src={embedUrl}
           title={`Dororo Episode ${episode.number}: ${episode.title}`}
@@ -702,8 +745,8 @@ export function VideoPlayer({
           </button>
         )}
 
-        {/* Synced Arabic (RTL) / External English Subtitle Overlay */}
-        {!useNativeEnglish &&
+        {/* Synced Arabic (RTL) / English (LTR) Subtitle Overlay */}
+        {!useNativeEnglishFallback &&
           subtitleLang !== "off" &&
           activeLines.length > 0 && (
             <div
@@ -768,7 +811,7 @@ export function VideoPlayer({
             })}
           </div>
 
-          {/* Right: Arabic CC / English CC / Off + Track Selector + Subtitle Menu */}
+          {/* Right: Arabic CC / English CC / Off + Release Track Selector + Style & Sync */}
           <div className="flex flex-wrap items-center gap-2">
             <span className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 mr-1">
               <Subtitles className="h-3.5 w-3.5 text-vermilion" />
@@ -808,30 +851,30 @@ export function VideoPlayer({
               />
             )}
 
-            {/* Track Switcher (Native Stream + up to 3 external tracks per language) */}
+            {/* Release-Aware Track Picker (External SubDL tracks + optional Native English Fallback) */}
             {showTrackPicker && (
               <div className="relative inline-flex items-center">
                 <Layers className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-zinc-400" />
                 <select
-                  aria-label="Subtitle Track"
-                  value={selectedTrackKey}
-                  onChange={(e) => setSelectedTrackKey(e.target.value)}
-                  className="rounded-lg border border-hairline bg-obsidian py-1.5 pl-7 pr-6 text-xs font-medium text-zinc-200 focus:border-vermilion focus:outline-none"
+                  aria-label="Subtitle Release Track"
+                  value={selectedTrackId}
+                  onChange={(e) => handleTrackChange(e.target.value)}
+                  className="max-w-[13rem] sm:max-w-[16rem] truncate rounded-lg border border-hairline bg-obsidian py-1.5 pl-7 pr-6 text-xs font-medium text-zinc-200 focus:border-vermilion focus:outline-none"
                 >
-                  {subtitleLang === "en" && activeServer.supportsNativeEn && (
-                    <option value="native" className="bg-charcoal">
-                      Stream Native (Default)
-                    </option>
-                  )}
-                  {tracks.map((t, idx) => (
+                  {candidates.map((cand) => (
                     <option
-                      key={t.id}
-                      value={String(idx)}
+                      key={cand.id}
+                      value={cand.id}
                       className="bg-charcoal"
                     >
-                      {t.label}
+                      {cand.label}
                     </option>
                   ))}
+                  {subtitleLang === "en" && activeServer.supportsNativeEn && (
+                    <option value="native-fallback" className="bg-charcoal">
+                      AnimeEmbed Native (Fallback)
+                    </option>
+                  )}
                 </select>
               </div>
             )}
@@ -849,15 +892,17 @@ export function VideoPlayer({
               >
                 <SlidersHorizontal className="h-3.5 w-3.5" />
                 <span>Style &amp; Sync</span>
-                {!useNativeEnglish && subtitleLang !== "off" && syncOffset !== 0 && (
-                  <span className="rounded bg-vermilion/20 px-1 py-0.5 font-mono text-[10px] text-vermilion">
-                    {formattedOffset}
-                  </span>
-                )}
+                {!useNativeEnglishFallback &&
+                  subtitleLang !== "off" &&
+                  currentOffset !== 0 && (
+                    <span className="rounded bg-vermilion/20 px-1 py-0.5 font-mono text-[10px] text-vermilion">
+                      {formattedOffset}
+                    </span>
+                  )}
               </button>
 
               {styleOpen && (
-                <div className="absolute right-0 left-auto z-40 mt-2 w-[min(19.5rem,calc(100vw-2rem))] rounded-xl border border-hairline bg-charcoal p-4 shadow-2xl">
+                <div className="absolute right-0 left-auto z-40 mt-2 w-[min(20rem,calc(100vw-2rem))] rounded-xl border border-hairline bg-charcoal p-4 shadow-2xl">
                   <div className="flex items-center justify-between border-b border-hairline pb-2.5">
                     <span className="text-xs font-semibold text-white">
                       Subtitle Menu &amp; Sync
@@ -875,8 +920,25 @@ export function VideoPlayer({
                     </button>
                   </div>
 
+                  {/* Selected Release Metadata Readout */}
+                  {!useNativeEnglishFallback &&
+                    subtitleLang !== "off" &&
+                    selectedReleaseName && (
+                      <div className="mt-2.5 rounded-md border border-hairline bg-obsidian/60 px-2.5 py-1.5">
+                        <span className="block text-[10px] uppercase tracking-wider text-zinc-500">
+                          Active Release
+                        </span>
+                        <span
+                          title={selectedReleaseName}
+                          className="block truncate font-mono text-[11px] text-zinc-300"
+                        >
+                          {selectedReleaseName}
+                        </span>
+                      </div>
+                    )}
+
                   {/* Real-Time Subtitle Sync Control (-0.5s, readout, +0.5s, Reset) */}
-                  {!useNativeEnglish && subtitleLang !== "off" && (
+                  {!useNativeEnglishFallback && subtitleLang !== "off" && (
                     <div className="mt-3 rounded-lg border border-hairline bg-obsidian/70 p-2.5">
                       <div className="flex items-center justify-between text-[11px]">
                         <span className="font-medium text-zinc-300">
@@ -889,14 +951,14 @@ export function VideoPlayer({
                       <div className="mt-2 grid grid-cols-3 gap-1.5">
                         <button
                           type="button"
-                          onClick={() => updateSyncOffset(syncOffset - 0.5)}
+                          onClick={() => updateSyncOffset(currentOffset - 0.5)}
                           className="rounded-md border border-hairline bg-charcoal py-1.5 text-xs font-mono font-medium text-zinc-200 transition-colors hover:border-vermilion hover:text-white"
                         >
                           -0.5s
                         </button>
                         <button
                           type="button"
-                          onClick={() => updateSyncOffset(syncOffset + 0.5)}
+                          onClick={() => updateSyncOffset(currentOffset + 0.5)}
                           className="rounded-md border border-hairline bg-charcoal py-1.5 text-xs font-mono font-medium text-zinc-200 transition-colors hover:border-vermilion hover:text-white"
                         >
                           +0.5s
