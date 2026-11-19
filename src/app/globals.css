@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    background-color: #09090b;
+    color: #f4f4f5;
+    scroll-behavior: smooth;
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: #09090b;
+    color: #f4f4f5;
+    min-height: 100dvh;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+/* Crisp cinema-grade subtitle outline (no black box by default) */
+.subtitle-cinema-outline {
+  text-shadow:
+    -1.5px -1.5px 0 rgba(0, 0, 0, 0.96),
+     1.5px -1.5px 0 rgba(0, 0, 0, 0.96),
+    -1.5px  1.5px 0 rgba(0, 0, 0, 0.96),
+     1.5px  1.5px 0 rgba(0, 0, 0, 0.96),
+     0px    2px   6px rgba(0, 0, 0, 0.95);
+}
+
+/* Fullscreen wrapper support across Desktop, Android, and iOS Safari fallback */
+.player-stage:fullscreen {
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: none !important;
+  border-radius: 0 !important;
+  background-color: #000000 !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.player-stage:fullscreen iframe {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.player-stage-pseudo-fs {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 60 !important;
+  width: 100vw !important;
+  height: 100dvh !important;
+  max-width: none !important;
+  border-radius: 0 !important;
+  border: 0 !important;
+  background-color: #000000 !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.player-stage-pseudo-fs iframe {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Subtle dark scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #09090b;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}

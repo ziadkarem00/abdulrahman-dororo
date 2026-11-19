@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <rect width="64" height="64" rx="14" fill="#09090B" />
+  <rect x="2" y="2" width="60" height="60" rx="12" stroke="#232329" stroke-width="2" />
+  <!-- Crimson Sengoku Sun / Demon Seal -->
+  <circle cx="32" cy="32" r="14" fill="#C81E1E" />
+  <!-- Crossed Prosthetic Katana Blades -->
+  <path d="M15 47L45 15L49 17L20 49L15 47Z" fill="#E7DFD3" />
+  <path d="M49 47L19 15L15 17L44 49L49 47Z" fill="#E7DFD3" />
+  <!-- Center Hilt Guard -->
+  <circle cx="32" cy="32" r="3.5" fill="#09090B" stroke="#E7DFD3" stroke-width="1.5" />
+</svg>
