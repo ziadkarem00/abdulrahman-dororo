@@ -31,7 +31,7 @@ import type {
 } from "@/types/dororo";
 
 const SUB_STYLE_STORAGE_KEY = "abdulrahman_dororo_sub_style_v1";
-const SUB_CACHE_VERSION = "1";
+const SUB_CACHE_VERSION = "3";
 
 const DEFAULT_SUB_STYLE: SubtitleStyle = {
   size: "md",
@@ -89,6 +89,8 @@ export function VideoPlayer({
   // Zero-drift performance.now() playback clock anchored to AnimeEmbed postMessage events
   const anchorVideoTimeRef = useRef<number>(0);
   const anchorPerfTimeRef = useRef<number>(0);
+  const lastReportedTimeRef = useRef<number>(-1);
+  const playbackRateRef = useRef<number>(1);
   const isPlayingRef = useRef<boolean>(false);
   const hasEndedMarkedRef = useRef<boolean>(false);
   const lastRenderedKeyRef = useRef<string>("");
@@ -150,6 +152,8 @@ export function VideoPlayer({
   useEffect(() => {
     anchorVideoTimeRef.current = 0;
     anchorPerfTimeRef.current = performance.now();
+    lastReportedTimeRef.current = -1;
+    playbackRateRef.current = 1;
     isPlayingRef.current = false;
     hasEndedMarkedRef.current = false;
     lastRenderedKeyRef.current = "";
@@ -225,6 +229,10 @@ export function VideoPlayer({
           currentTime?: number;
           position?: number;
           duration?: number;
+          speed?: number;
+          playbackRate?: number;
+          paused?: boolean;
+          playing?: boolean;
         };
       } | null;
 
@@ -240,11 +248,38 @@ export function VideoPlayer({
           ? msg.data.position
           : null;
 
+      const reportedRate =
+        typeof msg.data?.playbackRate === "number" && msg.data.playbackRate > 0
+          ? msg.data.playbackRate
+          : typeof msg.data?.speed === "number" && msg.data.speed > 0
+          ? msg.data.speed
+          : null;
+
+      if (reportedRate !== null) {
+        playbackRateRef.current = reportedRate;
+      }
+
       switch (msg.event) {
-        case "progress": {
+        case "progress":
+        case "timeupdate":
+        case "seeked": {
           if (reportedTime !== null && Number.isFinite(reportedTime)) {
+            const prevReported = lastReportedTimeRef.current;
+            // If progress is advancing forward after buffering/start, ensure clock runs smoothly
+            if (msg.data?.paused === true) {
+              isPlayingRef.current = false;
+            } else if (
+              msg.data?.playing === true ||
+              (prevReported >= 0 &&
+                reportedTime > prevReported + 0.01 &&
+                reportedTime - prevReported < 3.0)
+            ) {
+              isPlayingRef.current = true;
+            }
+
             anchorVideoTimeRef.current = reportedTime;
             anchorPerfTimeRef.current = now;
+            lastReportedTimeRef.current = reportedTime;
           }
           if (
             !hasEndedMarkedRef.current &&
@@ -261,6 +296,7 @@ export function VideoPlayer({
         case "play": {
           if (reportedTime !== null && Number.isFinite(reportedTime)) {
             anchorVideoTimeRef.current = reportedTime;
+            lastReportedTimeRef.current = reportedTime;
           }
           anchorPerfTimeRef.current = now;
           isPlayingRef.current = true;
@@ -270,8 +306,13 @@ export function VideoPlayer({
         case "buffering": {
           if (reportedTime !== null && Number.isFinite(reportedTime)) {
             anchorVideoTimeRef.current = reportedTime;
+            lastReportedTimeRef.current = reportedTime;
           } else if (isPlayingRef.current) {
-            anchorVideoTimeRef.current += (now - anchorPerfTimeRef.current) / 1000;
+            const delta = Math.min(
+              2.0,
+              (now - anchorPerfTimeRef.current) / 1000
+            );
+            anchorVideoTimeRef.current += delta * playbackRateRef.current;
           }
           anchorPerfTimeRef.current = now;
           isPlayingRef.current = false;
@@ -294,7 +335,7 @@ export function VideoPlayer({
     return () => window.removeEventListener("message", handleMessage);
   }, [embedUrl, onAutoMarkWatched]);
 
-  // Smooth requestAnimationFrame subtitle sync loop (zero timer drift)
+  // Smooth requestAnimationFrame subtitle sync loop (zero drift + stall-clamped)
   useEffect(() => {
     if (subtitleLang === "off" || cues.length === 0) {
       lastRenderedKeyRef.current = "";
@@ -305,10 +346,15 @@ export function VideoPlayer({
     let rafId = 0;
 
     const tick = () => {
-      const elapsed = isPlayingRef.current
+      // Clamp extrapolation between progress heartbeats to 2.0s so a silent stall/pause never drifts ahead
+      const rawElapsed = isPlayingRef.current
         ? (performance.now() - anchorPerfTimeRef.current) / 1000
         : 0;
-      const videoTime = anchorVideoTimeRef.current + elapsed + subStyle.offset;
+      const clampedElapsed = Math.min(2.0, Math.max(0, rawElapsed));
+      const videoTime =
+        anchorVideoTimeRef.current +
+        clampedElapsed * playbackRateRef.current +
+        subStyle.offset;
 
       const matched = findActiveCues(cues, videoTime);
       const nextLines = matched.map((c) => c.text);
@@ -396,14 +442,12 @@ export function VideoPlayer({
         setIsPseudoFullscreen(true);
       }
     } catch {
-      // Fallback for iOS Safari / embedded mobile webviews
       setIsPseudoFullscreen(true);
     }
   }, [isPseudoFullscreen]);
 
   const inAnyFullscreen = isFullscreen || isPseudoFullscreen;
 
-  // Subtitle typography & placement classes (scales up cleanly in fullscreen)
   const sizeClass = useMemo(() => {
     const map: Record<SubtitleSize, string> = inAnyFullscreen
       ? {
@@ -424,7 +468,8 @@ export function VideoPlayer({
   const bgClass = useMemo(() => {
     const map: Record<SubtitleBackground, string> = {
       none: "bg-transparent subtitle-cinema-outline px-1.5 py-0.5",
-      subtle: "bg-black/50 backdrop-blur-[2px] rounded-md px-3 py-1 subtitle-cinema-outline",
+      subtle:
+        "bg-black/50 backdrop-blur-[2px] rounded-md px-3 py-1 subtitle-cinema-outline",
       box: "bg-black/85 rounded-md px-3.5 py-1.5",
     };
     return map[subStyle.background];
@@ -651,7 +696,7 @@ export function VideoPlayer({
               </button>
 
               {styleOpen && (
-                <div className="absolute right-0 sm:right-0 left-auto z-40 mt-2 w-[min(18.5rem,calc(100vw-2rem))] rounded-xl border border-hairline bg-charcoal p-4 shadow-2xl">
+                <div className="absolute right-0 left-auto z-40 mt-2 w-[min(19.5rem,calc(100vw-2rem))] rounded-xl border border-hairline bg-charcoal p-4 shadow-2xl">
                   <div className="flex items-center justify-between border-b border-hairline pb-2.5">
                     <span className="text-xs font-semibold text-white">
                       Subtitle Appearance &amp; Sync
@@ -791,40 +836,38 @@ export function VideoPlayer({
                       </span>
                       <span className="font-mono text-zinc-200">
                         {subStyle.offset > 0
-                          ? `+${subStyle.offset.toFixed(1)}s`
-                          : `${subStyle.offset.toFixed(1)}s`}
+                          ? `+${subStyle.offset.toFixed(2)}s`
+                          : `${subStyle.offset.toFixed(2)}s`}
                       </span>
                     </div>
-                    <div className="mt-1.5 grid grid-cols-3 gap-1">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          updateSubStyle({
-                            offset: Number((subStyle.offset - 0.5).toFixed(1)),
-                          })
-                        }
-                        className="rounded-md border border-hairline bg-obsidian py-1 text-xs font-mono text-zinc-300 hover:border-zinc-700 hover:text-white"
-                      >
-                        -0.5s
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => updateSubStyle({ offset: 0 })}
-                        className="rounded-md border border-hairline bg-obsidian py-1 text-xs font-mono text-zinc-300 hover:border-zinc-700 hover:text-white"
-                      >
-                        0.0s
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          updateSubStyle({
-                            offset: Number((subStyle.offset + 0.5).toFixed(1)),
-                          })
-                        }
-                        className="rounded-md border border-hairline bg-obsidian py-1 text-xs font-mono text-zinc-300 hover:border-zinc-700 hover:text-white"
-                      >
-                        +0.5s
-                      </button>
+                    <div className="mt-1.5 grid grid-cols-5 gap-1">
+                      {(
+                        [
+                          { delta: -1, label: "-1s" },
+                          { delta: -0.25, label: "-.25" },
+                          { delta: 0, label: "0.0" },
+                          { delta: 0.25, label: "+.25" },
+                          { delta: 1, label: "+1s" },
+                        ] as const
+                      ).map((btn) => (
+                        <button
+                          key={btn.label}
+                          type="button"
+                          onClick={() =>
+                            updateSubStyle({
+                              offset:
+                                btn.delta === 0
+                                  ? 0
+                                  : Number(
+                                      (subStyle.offset + btn.delta).toFixed(2)
+                                    ),
+                            })
+                          }
+                          className="rounded-md border border-hairline bg-obsidian py-1 text-[11px] font-mono text-zinc-300 hover:border-zinc-700 hover:text-white"
+                        >
+                          {btn.label}
+                        </button>
+                      ))}
                     </div>
                   </div>
                 </div>
