@@ -43,9 +43,7 @@ function decodeHtmlEntities(text: string): string {
 
 function stripMarkup(text: string): string {
   const cleaned = text
-    // Strip ASS/SSA override tags like {\an8}, {\i1}, {\pos(x,y)}
     .replace(/\{\\[^}]*\}/g, "")
-    // Strip standard HTML formatting tags only (avoid eating dialogue in angle brackets)
     .replace(
       /<\/?(?:i|b|u|s|font|span|div|br|p|c|ruby|rt|v|lang)(?:\s[^>]*)?>/gi,
       ""
@@ -55,8 +53,8 @@ function stripMarkup(text: string): string {
 }
 
 /**
- * Decodes raw subtitle bytes, handling UTF-8, UTF-16LE/BE BOMs,
- * and legacy Windows-1256 Arabic SRT files without corrupting characters.
+ * Decodes raw subtitle bytes cleanly into UTF-8 text, supporting UTF-8,
+ * UTF-16LE/BE BOMs, and legacy Windows-1256 Arabic SRT files.
  */
 export function decodeSubtitleBuffer(
   buffer: ArrayBuffer,
@@ -82,11 +80,34 @@ export function decodeSubtitleBuffer(
         return win1256;
       }
     } catch {
-      // Fallback to UTF-8 if runtime lacks windows-1256 decoder
+      // Fallback to UTF-8 if runtime lacks windows-1256
     }
   }
 
   return utf8;
+}
+
+/**
+ * Cleanly converts an SRT (or mixed) subtitle string into valid UTF-8 WebVTT (`WEBVTT`).
+ * Preserves Arabic UTF-8 characters and normalizes comma timestamps to dot timestamps.
+ */
+export function srtToWebVtt(raw: string): string {
+  const cleaned = raw
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim();
+
+  if (cleaned.startsWith("WEBVTT")) {
+    return cleaned;
+  }
+
+  const converted = cleaned.replace(
+    /(\d{1,2}:\d{2}:\d{2}),(\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}),(\d{1,3})/g,
+    "$1.$2 --> $3.$4"
+  );
+
+  return `WEBVTT\n\n${converted}\n`;
 }
 
 export function normalizeArabicLine(line: string): string {
@@ -97,7 +118,6 @@ export function normalizeArabicLine(line: string): string {
     s = s.replace(/\?/g, "؟").replace(/,/g, "،");
   }
 
-  // Move legacy fansub leading punctuation (e.g. ".مرحبا") to logical end ("مرحبا.")
   const leadingPunctMatch = s.match(/^([.!?؟،…]+)\s*(.+)$/);
   if (leadingPunctMatch && ARABIC_CHAR_REGEX.test(leadingPunctMatch[2])) {
     const punct = leadingPunctMatch[1];
@@ -154,19 +174,15 @@ export function hasEnglishContent(cues: SubtitleCue[]): boolean {
 }
 
 /**
- * Line-by-line state-machine SRT / WebVTT parser.
+ * Line-by-line state-machine WebVTT/SRT parser (converts SRT to valid WebVTT first).
  * Never drops cues when blank separator lines contain spaces or are missing.
  */
 export function parseSubtitleText(
   raw: string,
   normalizeArabic = false
 ): SubtitleCue[] {
-  const normalized = raw
-    .replace(/^\uFEFF/, "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
-
-  const lines = normalized.split("\n");
+  const vttText = srtToWebVtt(raw);
+  const lines = vttText.split("\n");
   const cues: SubtitleCue[] = [];
 
   let currentStart: number | null = null;
@@ -174,14 +190,17 @@ export function parseSubtitleText(
   let currentLines: string[] = [];
 
   const flushCue = () => {
-    if (currentStart === null || currentEnd === null || currentLines.length === 0) {
+    if (
+      currentStart === null ||
+      currentEnd === null ||
+      currentLines.length === 0
+    ) {
       currentStart = null;
       currentEnd = null;
       currentLines = [];
       return;
     }
 
-    // If the last accumulated line is a standalone numeric index for the next cue, pop it
     while (
       currentLines.length > 1 &&
       /^\d+$/.test(currentLines[currentLines.length - 1].trim())
@@ -218,7 +237,6 @@ export function parseSubtitleText(
   for (let i = 0; i < lines.length; i++) {
     const trimmed = lines[i].trim();
 
-    // Skip WebVTT header/NOTE/STYLE blocks
     if (currentStart === null) {
       if (
         trimmed.startsWith("WEBVTT") ||
@@ -239,7 +257,6 @@ export function parseSubtitleText(
 
     const tsMatch = trimmed.match(TIMESTAMP_LINE_REGEX);
     if (tsMatch) {
-      // Flush previous cue before starting the new one
       flushCue();
       const start = parseTimestamp(tsMatch[1]);
       const end = parseTimestamp(tsMatch[2]);
@@ -268,8 +285,28 @@ export function parseSubtitleText(
 }
 
 /**
- * Returns ALL cues active at `timeSeconds` with a 40ms boundary tolerance
- * so overlapping signs + dialogue never flicker or drop.
+ * Dynamically shifts all subtitle cue start/end timestamps by `offsetSeconds`,
+ * clamping both timestamps to `>= 0` without reloading the video stream.
+ */
+export function shiftSubtitleCues(
+  cues: SubtitleCue[],
+  offsetSeconds: number
+): SubtitleCue[] {
+  if (!offsetSeconds || !cues.length) return cues;
+  const shifted: SubtitleCue[] = [];
+  for (let i = 0; i < cues.length; i++) {
+    const cue = cues[i];
+    const start = Math.max(0, Number((cue.start + offsetSeconds).toFixed(3)));
+    const end = Math.max(0, Number((cue.end + offsetSeconds).toFixed(3)));
+    if (end > start) {
+      shifted.push({ start, end, text: cue.text });
+    }
+  }
+  return shifted;
+}
+
+/**
+ * Returns ALL cues active at `timeSeconds` with a 40ms boundary tolerance.
  */
 export function findActiveCues(
   cues: SubtitleCue[],

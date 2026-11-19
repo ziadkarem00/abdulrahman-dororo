@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { DORORO_IMDB_ID, TOTAL_EPISODES } from "@/lib/dororo-data";
+import {
+  DORORO_IMDB_ID,
+  DORORO_TMDB_ID,
+  TOTAL_EPISODES,
+} from "@/lib/dororo-data";
 import {
   decodeSubtitleBuffer,
   hasArabicContent,
@@ -15,8 +19,19 @@ export const maxDuration = 30;
 const FETCH_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-  Accept: "text/html,application/json,text/plain,*/*",
+  Accept: "application/json,text/vtt,text/plain,text/html,*/*",
 };
+
+interface WyzieEntry {
+  id?: string;
+  url?: string;
+  format?: string;
+  language?: string;
+  display?: string;
+  release?: string;
+  fileName?: string;
+  source?: string;
+}
 
 interface OpenSubEntry {
   url?: string;
@@ -26,7 +41,7 @@ interface OpenSubEntry {
 
 interface ScoredTrack {
   id: string;
-  label: string;
+  releaseTag: string;
   source: string;
   cues: SubtitleCue[];
   score: number;
@@ -73,6 +88,29 @@ function makeFingerprint(cues: SubtitleCue[]): string {
   return `${count}:${first}:${mid}:${last}`;
 }
 
+function scoreReleaseHint(hint: string): { bonus: number; tag: string } {
+  const lower = hint.toLowerCase();
+  if (lower.includes("web-dl") || lower.includes("webdl")) {
+    return { bonus: 30, tag: "WEB-DL" };
+  }
+  if (lower.includes("webrip") || lower.includes("web-rip")) {
+    return { bonus: 26, tag: "WEBRip" };
+  }
+  if (
+    lower.includes("amzn") ||
+    lower.includes("prime") ||
+    lower.includes("web") ||
+    lower.includes("horriblesubs") ||
+    lower.includes("erai")
+  ) {
+    return { bonus: 24, tag: "WEB" };
+  }
+  if (lower.includes("bdrip") || lower.includes("blu")) {
+    return { bonus: 8, tag: "BDRip" };
+  }
+  return { bonus: 0, tag: "" };
+}
+
 function scoreTrackQuality(cues: SubtitleCue[], hint = ""): number {
   if (cues.length < 40) return 0;
   let score = 0;
@@ -92,20 +130,97 @@ function scoreTrackQuality(cues: SubtitleCue[], hint = ""): number {
     score += 15;
   }
 
-  const lower = hint.toLowerCase();
-  if (
-    lower.includes("web") ||
-    lower.includes("amzn") ||
-    lower.includes("prime") ||
-    lower.includes("horriblesubs") ||
-    lower.includes("erai")
-  ) {
-    score += 22;
-  } else if (lower.includes("bdrip") || lower.includes("blu")) {
-    score += 8;
+  score += scoreReleaseHint(hint).bonus;
+  return score;
+}
+
+/**
+ * Primary External Subtitle Provider: Wyzie Subs API using Dororo TMDB ID (83100).
+ * Filters & sorts to prioritize WEB-DL / WEBRip releases and converts SRT -> UTF-8 WebVTT.
+ */
+async function fetchFromWyzie(
+  episode: number,
+  targetLang: "en" | "ar"
+): Promise<ScoredTrack[]> {
+  const apiKey = process.env.WYZIE_API_KEY?.trim();
+  const keyParam = apiKey ? `&key=${encodeURIComponent(apiKey)}` : "";
+  const endpoints = [
+    `https://sub.wyzie.io/search?id=${DORORO_TMDB_ID}&season=1&episode=${episode}&language=en,ar${keyParam}`,
+    `https://sub.wyzie.ru/search?id=${DORORO_TMDB_ID}&season=1&episode=${episode}&language=en,ar${keyParam}`,
+  ];
+
+  let entries: WyzieEntry[] = [];
+
+  for (const url of endpoints) {
+    const raw = await fetchTextWithTimeout(url, 6500, false);
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw) as WyzieEntry[] | { subtitles?: WyzieEntry[] };
+      const list = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.subtitles)
+        ? parsed.subtitles
+        : [];
+      if (list.length > 0) {
+        entries = list;
+        break;
+      }
+    } catch {
+      // try mirror
+    }
   }
 
-  return score;
+  if (entries.length === 0) return [];
+
+  const langMatches = entries.filter((item) => {
+    if (!item.url) return false;
+    const code = (item.language ?? "").toLowerCase();
+    const disp = (item.display ?? "").toLowerCase();
+    if (targetLang === "ar") {
+      return code === "ar" || code === "ara" || disp.includes("arab");
+    }
+    return code === "en" || code === "eng" || disp.includes("english");
+  });
+
+  // Sort candidates before downloading so WEB-DL / WEBRip releases are fetched first
+  const sortedCandidates = [...langMatches].sort((a, b) => {
+    const aHint = `${a.release ?? ""} ${a.fileName ?? ""} ${a.url ?? ""}`;
+    const bHint = `${b.release ?? ""} ${b.fileName ?? ""} ${b.url ?? ""}`;
+    return scoreReleaseHint(bHint).bonus - scoreReleaseHint(aHint).bonus;
+  });
+
+  const downloaded = await Promise.all(
+    sortedCandidates.slice(0, 5).map(async (entry, idx) => {
+      if (!entry.url) return null;
+      const rawText = await fetchTextWithTimeout(
+        entry.url,
+        7500,
+        targetLang === "ar"
+      );
+      if (!rawText) return null;
+
+      // parseSubtitleText automatically converts SRT -> valid UTF-8 WebVTT before cue extraction
+      const cues = parseSubtitleText(rawText, targetLang === "ar");
+      if (targetLang === "ar" && !hasArabicContent(cues)) return null;
+      if (targetLang === "en" && !hasEnglishContent(cues)) return null;
+
+      const hint = `${entry.release ?? ""} ${entry.fileName ?? ""} ${entry.source ?? ""} ${entry.url}`;
+      const score = scoreTrackQuality(cues, hint) + 12; // slight preference for Wyzie curated tracks
+      if (score <= 12) return null;
+
+      const { tag } = scoreReleaseHint(hint);
+      return {
+        id: `wyzie-${targetLang}-${idx + 1}`,
+        releaseTag: tag || "Wyzie",
+        source: "wyzie",
+        cues,
+        score,
+        fingerprint: makeFingerprint(cues),
+      } satisfies ScoredTrack;
+    })
+  );
+
+  return downloaded.filter((t): t is ScoredTrack => t !== null);
 }
 
 function matchesDororoEpisode(title: string, episode: number): boolean {
@@ -167,12 +282,10 @@ async function fetchFromOpenSubtitlesEndpoint(
       const score = scoreTrackQuality(cues, entry.url);
       if (score <= 0) return null;
 
+      const { tag } = scoreReleaseHint(entry.url);
       return {
-        id: `${providerTag}-${idx + 1}`,
-        label:
-          providerTag === "os-v3"
-            ? `OpenSubtitles #${idx + 1}`
-            : `OS Archive #${idx + 1}`,
+        id: `${providerTag}-${targetLang}-${idx + 1}`,
+        releaseTag: tag || (providerTag === "os-v3" ? "OpenSub" : "Archive"),
         source: providerTag,
         cues,
         score,
@@ -211,18 +324,8 @@ async function fetchFromSubtitleCat(
       if (seenPaths.has(path) || !matchesDororoEpisode(title, episode)) continue;
       seenPaths.add(path);
 
-      let rank = 1;
-      const lower = title.toLowerCase();
-      if (lower.includes("2019")) rank += 4;
-      if (
-        lower.includes("web") ||
-        lower.includes("amzn") ||
-        lower.includes("prime")
-      ) {
-        rank += 6;
-      }
-      if (lower.includes("multi-subs")) rank += 2;
-      if (lower.includes("1080p")) rank += 1;
+      let rank = 1 + scoreReleaseHint(title).bonus;
+      if (title.toLowerCase().includes("2019")) rank += 8;
       foundPages.push({ path, title, rank });
     }
 
@@ -273,10 +376,10 @@ async function fetchFromSubtitleCat(
       const score = scoreTrackQuality(cues, page.title);
       if (score <= 0) return null;
 
-      const isWeb = /web|amzn|prime/i.test(page.title);
+      const { tag } = scoreReleaseHint(page.title);
       return {
-        id: `sc-${idx + 1}`,
-        label: isWeb ? "SubtitleCat WEB" : `SubtitleCat #${idx + 1}`,
+        id: `sc-${targetLang}-${idx + 1}`,
+        releaseTag: tag || "SubCat",
         source: "subtitlecat",
         cues,
         score,
@@ -354,7 +457,6 @@ async function translateBatchToArabic(
 }
 
 async function translateCuesToArabic(cues: SubtitleCue[]): Promise<SubtitleCue[]> {
-  // Paced 2-concurrency batching prevents Google 429 rate-limits on Vercel IPs
   const BATCH_SIZE = 28;
   const batches: SubtitleCue[][] = [];
   for (let i = 0; i < cues.length; i += BATCH_SIZE) {
@@ -413,8 +515,9 @@ export async function GET(request: NextRequest) {
   );
   const lang: "ar" | "en" = langParam === "en" ? "en" : "ar";
 
-  // Query 3 independent keyless APIs in parallel
-  const [osV3, osLegacy, subCat] = await Promise.all([
+  // Query Wyzie Subs (TMDB 83100) + OpenSubtitles v3 + OpenSubtitles Legacy + SubtitleCat in parallel
+  const [wyzie, osV3, osLegacy, subCat] = await Promise.all([
+    fetchFromWyzie(episode, lang),
     fetchFromOpenSubtitlesEndpoint(
       "https://opensubtitles-v3.strem.io",
       "os-v3",
@@ -430,17 +533,17 @@ export async function GET(request: NextRequest) {
     fetchFromSubtitleCat(episode, lang),
   ]);
 
-  let ranked = deduplicateAndRank([...osV3, ...osLegacy, ...subCat]);
+  let ranked = deduplicateAndRank([...wyzie, ...osV3, ...osLegacy, ...subCat]);
 
-  // For Arabic: if we don't have a high-scoring WEB-timed track (or < 2 options),
-  // also translate the best WEB-timed English track so there is ALWAYS a complete WEB-synced Arabic option
+  // For Arabic: ensure a WEB-DL/WEB-timed Arabic track is always available via translation if native coverage is thin
   if (lang === "ar") {
     const hasStrongNative = ranked.some(
       (t) => t.score >= 85 && t.cues.length >= 160
     );
 
     if (!hasStrongNative || ranked.length < 2) {
-      const [enOsV3, enSubCat] = await Promise.all([
+      const [enWyzie, enOsV3, enSubCat] = await Promise.all([
+        fetchFromWyzie(episode, "en"),
         fetchFromOpenSubtitlesEndpoint(
           "https://opensubtitles-v3.strem.io",
           "os-v3",
@@ -449,19 +552,17 @@ export async function GET(request: NextRequest) {
         ),
         fetchFromSubtitleCat(episode, "en"),
       ]);
-      const bestEnList = deduplicateAndRank([...enOsV3, ...enSubCat]);
-      const bestEn = bestEnList[0];
+      const bestEn = deduplicateAndRank([...enWyzie, ...enOsV3, ...enSubCat])[0];
 
       if (bestEn && bestEn.cues.length > 0) {
         const arabicCues = await translateCuesToArabic(bestEn.cues);
         if (arabicCues.length > 0) {
           const translatedTrack: ScoredTrack = {
             id: "web-translated-ar",
-            label: "WEB Sync (Auto-AR)",
+            releaseTag: "WEB Sync",
             source: `translated-${bestEn.source}`,
             cues: arabicCues,
-            // Prioritize WEB-translated track if no strong native track exists
-            score: hasStrongNative ? bestEn.score - 5 : bestEn.score + 10,
+            score: hasStrongNative ? bestEn.score - 4 : bestEn.score + 12,
             fingerprint: makeFingerprint(arabicCues),
           };
           ranked = deduplicateAndRank([...ranked, translatedTrack]);
@@ -470,10 +571,13 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  // Keep up to 4 cleanest distinct tracks so user can instant-switch if one release differs in timing
-  const topTracks: SubtitleTrack[] = ranked.slice(0, 4).map((t, i) => ({
+  // Expose up to 3 selectable tracks per language (e.g. "Arabic 1 (WEB-DL)", "Arabic 2", "Arabic 3")
+  const langLabel = lang === "ar" ? "Arabic" : "English";
+  const topTracks: SubtitleTrack[] = ranked.slice(0, 3).map((t, i) => ({
     id: t.id,
-    label: `Track ${i + 1} · ${t.label}`,
+    label: t.releaseTag
+      ? `${langLabel} ${i + 1} (${t.releaseTag})`
+      : `${langLabel} ${i + 1}`,
     source: t.source,
     count: t.cues.length,
     cues: t.cues,
@@ -484,6 +588,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json(
     {
       episode,
+      tmdbId: DORORO_TMDB_ID,
       lang,
       source: primary?.source ?? "none",
       count: primary?.count ?? 0,

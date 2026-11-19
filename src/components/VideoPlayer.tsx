@@ -18,7 +18,7 @@ import {
   Sun,
 } from "lucide-react";
 import { STREAM_SERVERS, TOTAL_EPISODES } from "@/lib/dororo-data";
-import { findActiveCues } from "@/lib/subtitles";
+import { findActiveCues, shiftSubtitleCues } from "@/lib/subtitles";
 import type {
   Episode,
   ServerId,
@@ -33,8 +33,8 @@ import type {
 } from "@/types/dororo";
 
 const SUB_STYLE_STORAGE_KEY = "abdulrahman_dororo_sub_style_v1";
-const EP_OFFSET_STORAGE_KEY = "abdulrahman_dororo_ep_offsets_v1";
-const SUB_CACHE_VERSION = "4";
+const SYNC_OFFSET_STORAGE_KEY = "abdulrahman_dororo_sync_offset_v1";
+const SUB_CACHE_VERSION = "5";
 
 const DEFAULT_SUB_STYLE: SubtitleStyle = {
   size: "md",
@@ -82,14 +82,14 @@ export function VideoPlayer({
   const styleMenuRef = useRef<HTMLDivElement | null>(null);
 
   const [tracks, setTracks] = useState<SubtitleTrack[]>([]);
-  const [selectedTrackIdx, setSelectedTrackIdx] = useState<number>(0);
+  // "native" uses AnimeEmbed's stream-native English track (default on Server 1 & 2);
+  // numeric index selects one of the up-to-3 external tracks ("Arabic 1/2/3" or "English 1/2/3")
+  const [selectedTrackKey, setSelectedTrackKey] = useState<string>("0");
   const [loadingSubs, setLoadingSubs] = useState(false);
   const [activeLines, setActiveLines] = useState<string[]>([]);
   const [styleOpen, setStyleOpen] = useState(false);
   const [subStyle, setSubStyle] = useState<SubtitleStyle>(DEFAULT_SUB_STYLE);
-  const [episodeOffsets, setEpisodeOffsets] = useState<Record<string, number>>(
-    {}
-  );
+  const [syncOffset, setSyncOffset] = useState<number>(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPseudoFullscreen, setIsPseudoFullscreen] = useState(false);
 
@@ -102,7 +102,6 @@ export function VideoPlayer({
   const hasEndedMarkedRef = useRef<boolean>(false);
   const lastRenderedKeyRef = useRef<string>("");
 
-  // Client-side cache of fetched subtitle track lists: `${ep}:${lang}` -> tracks[]
   const trackCacheRef = useRef<Map<string, SubtitleTrack[]>>(new Map());
 
   const activeServer = useMemo(
@@ -110,19 +109,32 @@ export function VideoPlayer({
     [serverId]
   );
 
-  // Use AnimeEmbed's 100% frame-accurate native stream English captions on Server 1 & 2!
+  // Default English on Server 1 & 2 to stream-native captions first; user can also pick English 1/2/3
+  useEffect(() => {
+    if (subtitleLang === "en" && activeServer.supportsNativeEn) {
+      setSelectedTrackKey("native");
+    } else {
+      setSelectedTrackKey("0");
+    }
+  }, [subtitleLang, activeServer.supportsNativeEn, episode.number]);
+
   const useNativeEnglish =
-    subtitleLang === "en" && activeServer.supportsNativeEn;
+    subtitleLang === "en" &&
+    activeServer.supportsNativeEn &&
+    selectedTrackKey === "native";
 
-  const activeCues: SubtitleCue[] = useMemo(() => {
+  const rawOverlayCues: SubtitleCue[] = useMemo(() => {
     if (useNativeEnglish || subtitleLang === "off") return [];
-    return tracks[selectedTrackIdx]?.cues ?? tracks[0]?.cues ?? [];
-  }, [tracks, selectedTrackIdx, useNativeEnglish, subtitleLang]);
+    const idx = Number(selectedTrackKey);
+    const chosen = Number.isFinite(idx) ? tracks[idx] : tracks[0];
+    return chosen?.cues ?? tracks[0]?.cues ?? [];
+  }, [tracks, selectedTrackKey, useNativeEnglish, subtitleLang]);
 
-  const currentOffset = useMemo(() => {
-    const epKey = `${episode.number}:${subtitleLang}:${selectedTrackIdx}`;
-    return episodeOffsets[epKey] ?? subStyle.offset;
-  }, [episodeOffsets, episode.number, subtitleLang, selectedTrackIdx, subStyle.offset]);
+  // Dynamically shift every cue's startTime & endTime (clamped >= 0) in real time without reloading video
+  const shiftedCues: SubtitleCue[] = useMemo(
+    () => shiftSubtitleCues(rawOverlayCues, syncOffset),
+    [rawOverlayCues, syncOffset]
+  );
 
   const embedUrl = useMemo(() => {
     const sizeMap: Record<SubtitleSize, "s" | "m" | "l" | "xl"> = {
@@ -146,7 +158,7 @@ export function VideoPlayer({
     subStyle.background,
   ]);
 
-  // Load saved subtitle style & per-episode offsets
+  // Load saved subtitle style & persisted sync offset from localStorage
   useEffect(() => {
     try {
       const saved = localStorage.getItem(SUB_STYLE_STORAGE_KEY);
@@ -154,9 +166,12 @@ export function VideoPlayer({
         const parsed = JSON.parse(saved) as Partial<SubtitleStyle>;
         setSubStyle((prev) => ({ ...prev, ...parsed }));
       }
-      const savedOffsets = localStorage.getItem(EP_OFFSET_STORAGE_KEY);
-      if (savedOffsets) {
-        setEpisodeOffsets(JSON.parse(savedOffsets) as Record<string, number>);
+      const savedOffset = localStorage.getItem(SYNC_OFFSET_STORAGE_KEY);
+      if (savedOffset !== null) {
+        const num = Number(savedOffset);
+        if (Number.isFinite(num)) {
+          setSyncOffset(num);
+        }
       }
     } catch {
       // ignore storage errors
@@ -175,21 +190,15 @@ export function VideoPlayer({
     });
   }, []);
 
-  const setTrackOffset = useCallback(
-    (nextVal: number) => {
-      const epKey = `${episode.number}:${subtitleLang}:${selectedTrackIdx}`;
-      setEpisodeOffsets((prev) => {
-        const next = { ...prev, [epKey]: nextVal };
-        try {
-          localStorage.setItem(EP_OFFSET_STORAGE_KEY, JSON.stringify(next));
-        } catch {
-          // ignore
-        }
-        return next;
-      });
-    },
-    [episode.number, subtitleLang, selectedTrackIdx]
-  );
+  const updateSyncOffset = useCallback((nextVal: number) => {
+    const rounded = Number(nextVal.toFixed(1));
+    setSyncOffset(rounded);
+    try {
+      localStorage.setItem(SYNC_OFFSET_STORAGE_KEY, String(rounded));
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
 
   // Close style popover on outside click
   useEffect(() => {
@@ -206,7 +215,7 @@ export function VideoPlayer({
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, [styleOpen]);
 
-  // Reset clock when episode or server changes
+  // Reset clock when episode, server, or native-vs-overlay iframe mode changes
   useEffect(() => {
     anchorVideoTimeRef.current = 0;
     anchorPerfTimeRef.current = performance.now();
@@ -218,11 +227,10 @@ export function VideoPlayer({
     setActiveLines([]);
   }, [episode.number, serverId, useNativeEnglish]);
 
-  // Fetch multi-source subtitle tracks when using overlay (Arabic CC, or English CC on Dub)
+  // Fetch up to 3 external tracks per language (Wyzie TMDB 83100 + fallbacks)
   useEffect(() => {
-    if (subtitleLang === "off" || useNativeEnglish) {
+    if (subtitleLang === "off") {
       setTracks([]);
-      setSelectedTrackIdx(0);
       setActiveLines([]);
       setLoadingSubs(false);
       return;
@@ -232,16 +240,14 @@ export function VideoPlayer({
     const cached = trackCacheRef.current.get(cacheKey);
     if (cached) {
       setTracks(cached);
-      setSelectedTrackIdx(0);
       setLoadingSubs(false);
       return;
     }
 
     let cancelled = false;
     const controller = new AbortController();
-    setLoadingSubs(true);
+    setLoadingSubs(!useNativeEnglish);
     setTracks([]);
-    setSelectedTrackIdx(0);
     setActiveLines([]);
 
     fetch(
@@ -269,7 +275,7 @@ export function VideoPlayer({
             fetchedTracks = [
               {
                 id: "primary",
-                label: "Track 1",
+                label: subtitleLang === "ar" ? "Arabic 1" : "English 1",
                 source: data.source ?? "primary",
                 count: data.cues.length,
                 cues: data.cues,
@@ -278,7 +284,6 @@ export function VideoPlayer({
           }
           trackCacheRef.current.set(cacheKey, fetchedTracks);
           setTracks(fetchedTracks);
-          setSelectedTrackIdx(0);
         }
       )
       .catch(() => {
@@ -294,7 +299,7 @@ export function VideoPlayer({
     };
   }, [episode.number, subtitleLang, useNativeEnglish]);
 
-  // Resilient AnimeEmbed postMessage listener (accepts animeembed.com & subdomains + all time fields)
+  // Resilient AnimeEmbed postMessage listener
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       const frame = iframeRef.current;
@@ -444,9 +449,13 @@ export function VideoPlayer({
     return () => window.removeEventListener("message", handleMessage);
   }, [onAutoMarkWatched]);
 
-  // Smooth requestAnimationFrame subtitle sync loop (zero drift + stall-clamped)
+  // Smooth requestAnimationFrame subtitle sync loop using dynamically shifted cues
   useEffect(() => {
-    if (useNativeEnglish || subtitleLang === "off" || activeCues.length === 0) {
+    if (
+      useNativeEnglish ||
+      subtitleLang === "off" ||
+      shiftedCues.length === 0
+    ) {
       lastRenderedKeyRef.current = "";
       setActiveLines([]);
       return;
@@ -460,11 +469,9 @@ export function VideoPlayer({
         : 0;
       const clampedElapsed = Math.min(2.0, Math.max(0, rawElapsed));
       const videoTime =
-        anchorVideoTimeRef.current +
-        clampedElapsed * playbackRateRef.current +
-        currentOffset;
+        anchorVideoTimeRef.current + clampedElapsed * playbackRateRef.current;
 
-      const matched = findActiveCues(activeCues, videoTime);
+      const matched = findActiveCues(shiftedCues, videoTime);
       const nextLines = matched.map((c) => c.text);
       const key = nextLines.join("\n---\n");
 
@@ -478,7 +485,7 @@ export function VideoPlayer({
 
     rafId = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(rafId);
-  }, [activeCues, subtitleLang, useNativeEnglish, currentOffset]);
+  }, [shiftedCues, subtitleLang, useNativeEnglish]);
 
   // Track native fullscreen changes
   useEffect(() => {
@@ -596,6 +603,15 @@ export function VideoPlayer({
   }, [subStyle.position]);
 
   const isArabic = subtitleLang === "ar";
+  const showTrackPicker =
+    subtitleLang !== "off" &&
+    (tracks.length > 1 ||
+      (subtitleLang === "en" &&
+        activeServer.supportsNativeEn &&
+        tracks.length > 0));
+
+  const formattedOffset =
+    syncOffset > 0 ? `+${syncOffset.toFixed(1)}s` : `${syncOffset.toFixed(1)}s`;
 
   return (
     <section
@@ -653,7 +669,7 @@ export function VideoPlayer({
         </div>
       </div>
 
-      {/* 16:9 Theater Player Wrapper (Fullscreen target so captions stay visible!) */}
+      {/* 16:9 Theater Player Wrapper */}
       <div
         ref={stageRef}
         className={`player-stage relative w-full overflow-hidden rounded-xl border border-hairline bg-black shadow-2xl ${
@@ -662,7 +678,9 @@ export function VideoPlayer({
       >
         <iframe
           ref={iframeRef}
-          key={`${episode.number}-${serverId}-${useNativeEnglish ? "native-en" : "overlay"}`}
+          key={`${episode.number}-${serverId}-${
+            useNativeEnglish ? "native-en" : "overlay"
+          }`}
           src={embedUrl}
           title={`Dororo Episode ${episode.number}: ${episode.title}`}
           className="h-full w-full border-0"
@@ -684,7 +702,7 @@ export function VideoPlayer({
           </button>
         )}
 
-        {/* Synced Arabic (or Dub English) Subtitle Overlay */}
+        {/* Synced Arabic (RTL) / External English Subtitle Overlay */}
         {!useNativeEnglish &&
           subtitleLang !== "off" &&
           activeLines.length > 0 && (
@@ -750,7 +768,7 @@ export function VideoPlayer({
             })}
           </div>
 
-          {/* Right: Arabic CC / English CC / Off + Track Switcher + Style Popover */}
+          {/* Right: Arabic CC / English CC / Off + Track Selector + Subtitle Menu */}
           <div className="flex flex-wrap items-center gap-2">
             <span className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 mr-1">
               <Subtitles className="h-3.5 w-3.5 text-vermilion" />
@@ -790,26 +808,33 @@ export function VideoPlayer({
               />
             )}
 
-            {/* Instant Multi-Track Switcher (when multiple subtitle sources are available) */}
-            {!useNativeEnglish &&
-              subtitleLang !== "off" &&
-              tracks.length > 1 && (
-                <div className="relative inline-flex items-center">
-                  <Layers className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-zinc-400" />
-                  <select
-                    aria-label="Subtitle Track"
-                    value={selectedTrackIdx}
-                    onChange={(e) => setSelectedTrackIdx(Number(e.target.value))}
-                    className="rounded-lg border border-hairline bg-obsidian py-1.5 pl-7 pr-6 text-xs font-medium text-zinc-200 focus:border-vermilion focus:outline-none"
-                  >
-                    {tracks.map((t, idx) => (
-                      <option key={t.id} value={idx} className="bg-charcoal">
-                        {t.label} ({t.count})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
+            {/* Track Switcher (Native Stream + up to 3 external tracks per language) */}
+            {showTrackPicker && (
+              <div className="relative inline-flex items-center">
+                <Layers className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-zinc-400" />
+                <select
+                  aria-label="Subtitle Track"
+                  value={selectedTrackKey}
+                  onChange={(e) => setSelectedTrackKey(e.target.value)}
+                  className="rounded-lg border border-hairline bg-obsidian py-1.5 pl-7 pr-6 text-xs font-medium text-zinc-200 focus:border-vermilion focus:outline-none"
+                >
+                  {subtitleLang === "en" && activeServer.supportsNativeEn && (
+                    <option value="native" className="bg-charcoal">
+                      Stream Native (Default)
+                    </option>
+                  )}
+                  {tracks.map((t, idx) => (
+                    <option
+                      key={t.id}
+                      value={String(idx)}
+                      className="bg-charcoal"
+                    >
+                      {t.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             {/* Subtitle Style & Sync Popover */}
             <div ref={styleMenuRef} className="relative">
@@ -823,27 +848,69 @@ export function VideoPlayer({
                 }`}
               >
                 <SlidersHorizontal className="h-3.5 w-3.5" />
-                <span>Style</span>
+                <span>Style &amp; Sync</span>
+                {!useNativeEnglish && subtitleLang !== "off" && syncOffset !== 0 && (
+                  <span className="rounded bg-vermilion/20 px-1 py-0.5 font-mono text-[10px] text-vermilion">
+                    {formattedOffset}
+                  </span>
+                )}
               </button>
 
               {styleOpen && (
                 <div className="absolute right-0 left-auto z-40 mt-2 w-[min(19.5rem,calc(100vw-2rem))] rounded-xl border border-hairline bg-charcoal p-4 shadow-2xl">
                   <div className="flex items-center justify-between border-b border-hairline pb-2.5">
                     <span className="text-xs font-semibold text-white">
-                      Subtitle Appearance &amp; Sync
+                      Subtitle Menu &amp; Sync
                     </span>
                     <button
                       type="button"
                       onClick={() => {
                         updateSubStyle(DEFAULT_SUB_STYLE);
-                        setTrackOffset(0);
+                        updateSyncOffset(0);
                       }}
                       className="inline-flex items-center gap-1 text-[11px] text-zinc-400 hover:text-white"
                     >
                       <RotateCcw className="h-3 w-3" />
-                      Reset
+                      Reset All
                     </button>
                   </div>
+
+                  {/* Real-Time Subtitle Sync Control (-0.5s, readout, +0.5s, Reset) */}
+                  {!useNativeEnglish && subtitleLang !== "off" && (
+                    <div className="mt-3 rounded-lg border border-hairline bg-obsidian/70 p-2.5">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="font-medium text-zinc-300">
+                          Subtitle Sync
+                        </span>
+                        <span className="font-mono font-semibold text-white">
+                          {formattedOffset}
+                        </span>
+                      </div>
+                      <div className="mt-2 grid grid-cols-3 gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => updateSyncOffset(syncOffset - 0.5)}
+                          className="rounded-md border border-hairline bg-charcoal py-1.5 text-xs font-mono font-medium text-zinc-200 transition-colors hover:border-vermilion hover:text-white"
+                        >
+                          -0.5s
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateSyncOffset(syncOffset + 0.5)}
+                          className="rounded-md border border-hairline bg-charcoal py-1.5 text-xs font-mono font-medium text-zinc-200 transition-colors hover:border-vermilion hover:text-white"
+                        >
+                          +0.5s
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateSyncOffset(0)}
+                          className="rounded-md border border-hairline bg-charcoal py-1.5 text-xs font-medium text-zinc-400 transition-colors hover:border-zinc-600 hover:text-white"
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Size */}
                   <div className="mt-3">
@@ -961,50 +1028,6 @@ export function VideoPlayer({
                       </div>
                     </div>
                   </div>
-
-                  {/* Timing Sync (for overlay tracks) */}
-                  {!useNativeEnglish && subtitleLang !== "off" && (
-                    <div className="mt-3">
-                      <div className="flex items-center justify-between text-[11px]">
-                        <span className="font-medium text-zinc-400">
-                          Timing Sync (Ep {episode.number})
-                        </span>
-                        <span className="font-mono text-zinc-200">
-                          {currentOffset > 0
-                            ? `+${currentOffset.toFixed(2)}s`
-                            : `${currentOffset.toFixed(2)}s`}
-                        </span>
-                      </div>
-                      <div className="mt-1.5 grid grid-cols-5 gap-1">
-                        {(
-                          [
-                            { delta: -1, label: "-1s" },
-                            { delta: -0.25, label: "-.25" },
-                            { delta: 0, label: "0.0" },
-                            { delta: 0.25, label: "+.25" },
-                            { delta: 1, label: "+1s" },
-                          ] as const
-                        ).map((btn) => (
-                          <button
-                            key={btn.label}
-                            type="button"
-                            onClick={() =>
-                              setTrackOffset(
-                                btn.delta === 0
-                                  ? 0
-                                  : Number(
-                                      (currentOffset + btn.delta).toFixed(2)
-                                    )
-                              )
-                            }
-                            className="rounded-md border border-hairline bg-obsidian py-1 text-[11px] font-mono text-zinc-300 hover:border-zinc-700 hover:text-white"
-                          >
-                            {btn.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
                 </div>
               )}
             </div>

@@ -9,6 +9,7 @@ import type {
 export const DORORO_ANILIST_ID = 101347;
 export const DORORO_MAL_ID = 37520;
 export const DORORO_IMDB_ID = "tt9458304";
+export const DORORO_TMDB_ID = 83100;
 export const TOTAL_EPISODES = 24;
 
 function buildCommonParams(options?: EmbedCaptionOptions): string {
